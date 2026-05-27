@@ -42,10 +42,25 @@ RSS_SOURCES = [
     "https://sifted.eu/feed",
 ]
 
-MIN_GTM_SCORE = 6
+MIN_GTM_SCORE = 5
 QUALIFYING_STAGES = {
-    "Seed Extension", "Series A", "Series B",
-    "Series C", "Series D+", "Growth",
+    "Pre-seed", "Seed", "Seed Extension",
+    "Series A", "Series B", "Series C",
+    "Series D+", "Growth",
+}
+
+# Sector targeting: company must match at least one keyword to be kept.
+# Keywords are matched case-insensitively as substrings against the
+# "sector" field Gemini extracts (e.g. "Vertical AI - legal" matches "ai").
+PREFERRED_SECTOR_KEYWORDS = {
+    "web3", "crypto", "blockchain", "defi", "depin",
+    "decentralized", "onchain", "on-chain",
+    "ai", "artificial intelligence", "ml", "machine learning",
+    "llm", "genai", "vertical ai", "agentic", "agent",
+    "infra", "infrastructure", "devtools", "developer tools",
+    "devops", "data infrastructure", "cloud",
+    "healthcare", "health", "healthtech", "medtech",
+    "medical", "biotech", "digital health",
 }
 
 # Stay well under free-tier rate limits.
@@ -55,7 +70,7 @@ GEMINI_RATE_DELAY_SEC = 13
 # Keep per-run volume modest so daily quota lasts. With 5 feeds x 5 items = 25
 # Gemini calls/run max, scheduled every 6h = 100/day worst case. Most days
 # dedupe will kill most of these before they reach Gemini.
-MAX_ITEMS_PER_FEED = 5
+MAX_ITEMS_PER_FEED = 7
 
 # Stop processing further items once we've spent this much daily budget on
 # rate-limit retries — better to leave headroom for the next scheduled run.
@@ -90,10 +105,13 @@ Return ONLY raw JSON, no markdown fences, no commentary. Schema:
 }
 
 Scoring guide for gtm_fit_score:
-- 9-10: Series A/B/C, B2B SaaS, clear ICP, scaling phase, recognizable lead VC
-- 6-8: B2B with some flag (early-stage, niche sector, smaller raise)
-- 3-5: B2C, very early seed, or tangential GTM need
-- 0-2: Acquihires, biotech with no commercial team, infra-only research, deeptech with no customers
+- 9-10: Series A/B/C, B2B in AI/Web3/Infra/Healthcare/DePIN, clear ICP, scaling phase, recognizable lead VC
+- 6-8: B2B in target sectors (AI, Web3, crypto, DePIN, infra, devtools, healthtech, biotech), any stage Seed onward, with a real product
+- 4-5: Pre-seed/Seed in target sectors, OR Series A+ in adjacent B2B sectors
+- 2-3: B2C in target sectors, or B2B outside target sectors
+- 0-1: Acquihires, market commentary, layoff news, IPO filings, fund announcements, leadership changes, pure research/deeptech with no commercial team
+
+Target sectors (boost score for these): AI / vertical AI / agentic, Web3 / crypto / blockchain / DeFi / DePIN, developer infrastructure / devtools / cloud infra, healthcare / healthtech / biotech / medtech.
 
 If this isn't a funding round (acquisition, product news, opinion piece, market commentary, layoff/leadership news, IPO filing), return: {"is_funding_round": false}
 
@@ -174,6 +192,13 @@ def extract(client, item):
     return None
 
 
+def matches_preferred_sector(data):
+    sector = (data.get("sector") or "").lower()
+    one_liner = (data.get("one_liner") or "").lower()
+    haystack = f"{sector} {one_liner}"
+    return any(kw in haystack for kw in PREFERRED_SECTOR_KEYWORDS)
+
+
 def should_include(data):
     if not data or data == "DAILY_QUOTA":
         return False
@@ -184,6 +209,8 @@ def should_include(data):
     if not data.get("is_b2b"):
         return False
     if data.get("stage") not in QUALIFYING_STAGES:
+        return False
+    if not matches_preferred_sector(data):
         return False
     return True
 
