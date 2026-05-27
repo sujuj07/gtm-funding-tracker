@@ -49,20 +49,6 @@ QUALIFYING_STAGES = {
     "Series D+", "Growth",
 }
 
-# Sector targeting: company must match at least one keyword to be kept.
-# Keywords are matched case-insensitively as substrings against the
-# "sector" field Gemini extracts (e.g. "Vertical AI - legal" matches "ai").
-PREFERRED_SECTOR_KEYWORDS = {
-    "web3", "crypto", "blockchain", "defi", "depin",
-    "decentralized", "onchain", "on-chain",
-    "ai", "artificial intelligence", "ml", "machine learning",
-    "llm", "genai", "vertical ai", "agentic", "agent",
-    "infra", "infrastructure", "devtools", "developer tools",
-    "devops", "data infrastructure", "cloud",
-    "healthcare", "health", "healthtech", "medtech",
-    "medical", "biotech", "digital health",
-}
-
 # Stay well under free-tier rate limits.
 # 13s between calls = ~4.6 requests/minute (under 5 RPM limit on free tier).
 GEMINI_RATE_DELAY_SEC = 13
@@ -104,14 +90,13 @@ Return ONLY raw JSON, no markdown fences, no commentary. Schema:
   "open_gtm_roles_likely": true|false
 }
 
-Scoring guide for gtm_fit_score:
-- 9-10: Series A/B/C, B2B in AI/Web3/Infra/Healthcare/DePIN, clear ICP, scaling phase, recognizable lead VC
-- 6-8: B2B in target sectors (AI, Web3, crypto, DePIN, infra, devtools, healthtech, biotech), any stage Seed onward, with a real product
-- 4-5: Pre-seed/Seed in target sectors, OR Series A+ in adjacent B2B sectors
-- 2-3: B2C in target sectors, or B2B outside target sectors
-- 0-1: Acquihires, market commentary, layoff news, IPO filings, fund announcements, leadership changes, pure research/deeptech with no commercial team
-
-Target sectors (boost score for these): AI / vertical AI / agentic, Web3 / crypto / blockchain / DeFi / DePIN, developer infrastructure / devtools / cloud infra, healthcare / healthtech / biotech / medtech.
+Scoring guide for gtm_fit_score (think: how good a GTM-role target is this company right now?):
+- 9-10: Series A/B/C, B2B with clear ICP and product-market fit, scaling phase, recognizable lead VC, founder explicitly mentions hiring/growth/expansion
+- 7-8: Solid B2B at Series A+ but smaller raise, or niche sector with strong fundamentals
+- 5-6: Seed/Seed extension B2B with a real product, OR Series A+ in adjacent areas (verticalized SaaS, B2B marketplaces, fintech infra)
+- 3-4: Pre-seed B2B (founder still doing GTM themselves), OR B2C with strong growth team need
+- 1-2: B2C without clear GTM need, very early-stage exploration, niche deeptech
+- 0: Acquihires, market commentary, layoff news, IPO filings, fund announcements, leadership changes, pure research with no commercial team
 
 If this isn't a funding round (acquisition, product news, opinion piece, market commentary, layoff/leadership news, IPO filing), return: {"is_funding_round": false}
 
@@ -192,13 +177,6 @@ def extract(client, item):
     return None
 
 
-def matches_preferred_sector(data):
-    sector = (data.get("sector") or "").lower()
-    one_liner = (data.get("one_liner") or "").lower()
-    haystack = f"{sector} {one_liner}"
-    return any(kw in haystack for kw in PREFERRED_SECTOR_KEYWORDS)
-
-
 def should_include(data):
     if not data or data == "DAILY_QUOTA":
         return False
@@ -209,8 +187,6 @@ def should_include(data):
     if not data.get("is_b2b"):
         return False
     if data.get("stage") not in QUALIFYING_STAGES:
-        return False
-    if not matches_preferred_sector(data):
         return False
     return True
 
