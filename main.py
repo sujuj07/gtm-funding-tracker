@@ -2,8 +2,8 @@
 Funding -> GTM job tracker (webhook version).
 
 Pulls funding announcements from RSS feeds, extracts structured data with
-Gemini 2.5 Flash (free tier), filters for GTM-relevant rounds, posts new
-rows to a Google Apps Script webhook attached to your sheet.
+Gemini (free tier), filters for GTM-relevant rounds, posts new rows to a
+Google Apps Script webhook attached to your sheet.
 
 Required env vars:
   GEMINI_API_KEY    - from aistudio.google.com/apikey (free, no card)
@@ -12,6 +12,7 @@ Required env vars:
 """
 import os
 import re
+import sys
 import json
 import time
 import hashlib
@@ -28,6 +29,11 @@ GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 WEBHOOK_TOKEN = os.environ["WEBHOOK_TOKEN"]
 
+# Flash-Lite has more generous free-tier daily limits than Flash.
+# If this also rate-limits, fall back to "gemini-2.5-flash-lite" anyway —
+# it's the most generous free model.
+MODEL = "gemini-2.5-flash-lite"
+
 RSS_SOURCES = [
     "https://techcrunch.com/category/venture/feed/",
     "https://news.crunchbase.com/feed/",
@@ -42,8 +48,21 @@ QUALIFYING_STAGES = {
     "Series C", "Series D+", "Growth",
 }
 
-GEMINI_RATE_DELAY_SEC = 4
-MAX_ITEMS_PER_FEED = 25
+# Stay well under free-tier rate limits.
+# 13s between calls = ~4.6 requests/minute (under 5 RPM limit on free tier).
+GEMINI_RATE_DELAY_SEC = 13
+
+# Keep per-run volume modest so daily quota lasts. With 5 feeds x 5 items = 25
+# Gemini calls/run max, scheduled every 6h = 100/day worst case. Most days
+# dedupe will kill most of these before they reach Gemini.
+MAX_ITEMS_PER_FEED = 5
+
+# Stop processing further items once we've spent this much daily budget on
+# rate-limit retries — better to leave headroom for the next scheduled run.
+MAX_RATE_LIMIT_RETRIES_PER_ITEM = 2
+
+# Hard ceiling on total Gemini calls in one script invocation
+MAX_GEMINI_CALLS_PER_RUN = 30
 
 
 # ----- Prompt -----
@@ -76,7 +95,7 @@ Scoring guide for gtm_fit_score:
 - 3-5: B2C, very early seed, or tangential GTM need
 - 0-2: Acquihires, biotech with no commercial team, infra-only research, deeptech with no customers
 
-If this isn't a funding round (acquisition, product news, opinion piece), return: {"is_funding_round": false}
+If this isn't a funding round (acquisition, product news, opinion piece, market commentary, layoff/leadership news, IPO filing), return: {"is_funding_round": false}
 
 Title: %TITLE%
 Body: %BODY%"""
@@ -106,27 +125,59 @@ def fetch_items():
     return items
 
 
+def parse_retry_delay(error_str):
+    """Pull retryDelay seconds out of a Gemini error message, e.g. 'Please retry in 19.4s'."""
+    m = re.search(r"retry in ([\d.]+)s", str(error_str))
+    if m:
+        return min(float(m.group(1)) + 1, 60)
+    return None
+
+
 def extract(client, item):
+    """Returns parsed dict on success, 'DAILY_QUOTA' if daily limit hit, None on other failure."""
     prompt = EXTRACTION_PROMPT.replace("%TITLE%", item["title"]).replace("%BODY%", item["body"])
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-        )
-        text = (response.text or "").strip()
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip()
-        return json.loads(text)
-    except Exception as e:
-        print(f"[warn] extract failed for '{item['title'][:60]}': {e}")
-        return None
+    
+    for attempt in range(MAX_RATE_LIMIT_RETRIES_PER_ITEM + 1):
+        try:
+            response = client.models.generate_content(
+                model=MODEL,
+                contents=prompt,
+            )
+            text = (response.text or "").strip()
+            if text.startswith("```"):
+                text = text.strip("`")
+                if text.startswith("json"):
+                    text = text[4:]
+                text = text.strip()
+            return json.loads(text)
+        except Exception as e:
+            err_str = str(e)
+            # Daily quota = stop, save budget for next scheduled run
+            if "PerDay" in err_str:
+                print(f"[stop] hit daily Gemini quota — stopping run early to preserve next-run capacity")
+                return "DAILY_QUOTA"
+            # Per-minute quota = wait and retry
+            if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                wait = parse_retry_delay(err_str) or (15 * (attempt + 1))
+                print(f"  [retry] minute-quota hit, waiting {wait:.0f}s (attempt {attempt + 1})")
+                time.sleep(wait)
+                continue
+            # Temporary outage = brief wait then retry
+            if "503" in err_str or "UNAVAILABLE" in err_str:
+                print(f"  [retry] Gemini temporarily unavailable, waiting 20s")
+                time.sleep(20)
+                continue
+            print(f"[warn] extract failed for '{item['title'][:60]}': {e}")
+            return None
+    
+    print(f"[warn] extract gave up on '{item['title'][:60]}' after {MAX_RATE_LIMIT_RETRIES_PER_ITEM} retries")
+    return None
 
 
 def should_include(data):
-    if not data or not data.get("is_funding_round"):
+    if not data or data == "DAILY_QUOTA":
+        return False
+    if not data.get("is_funding_round"):
         return False
     if data.get("gtm_fit_score", 0) < MIN_GTM_SCORE:
         return False
@@ -143,24 +194,59 @@ def fetch_existing_sources():
             WEBHOOK_URL,
             params={"token": WEBHOOK_TOKEN, "action": "existing_sources"},
             timeout=30,
+            allow_redirects=True,
         )
-        data = r.json()
-        if data.get("ok"):
-            return set(data.get("sources", []))
-        print(f"[warn] couldn't fetch existing sources: {data}")
     except Exception as e:
-        print(f"[warn] couldn't fetch existing sources: {e}")
-    return set()
+        print(f"\n[FATAL] Could not reach webhook: {e}")
+        sys.exit(1)
+    
+    if r.status_code == 401 or r.status_code == 403:
+        print("\n[FATAL] Webhook returned 401/403 Unauthorized.")
+        print("Most likely cause: in Apps Script > Deploy > Manage deployments,")
+        print("'Who has access' was set to 'Anyone with Google account' instead of 'Anyone'.")
+        print("Edit the deployment, change to 'Anyone', create a new version, redeploy.")
+        sys.exit(1)
+    
+    if not r.ok:
+        print(f"\n[FATAL] Webhook returned HTTP {r.status_code}")
+        print(f"Response preview: {r.text[:300]}")
+        sys.exit(1)
+    
+    try:
+        data = r.json()
+    except Exception:
+        print("\n[FATAL] Webhook didn't return JSON. This usually means the deployment URL is wrong")
+        print("or the deployment doesn't exist yet. Re-deploy and update the WEBHOOK_URL secret.")
+        print(f"Response preview: {r.text[:300]}")
+        sys.exit(1)
+    
+    if not data.get("ok"):
+        print(f"[warn] webhook GET returned: {data}")
+        return set()
+    
+    return set(data.get("sources", []))
 
 
 def append_rows(rows):
-    r = requests.post(
-        WEBHOOK_URL,
-        json={"token": WEBHOOK_TOKEN, "rows": rows},
-        timeout=60,
-    )
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.post(
+            WEBHOOK_URL,
+            json={"token": WEBHOOK_TOKEN, "rows": rows},
+            timeout=60,
+        )
+    except Exception as e:
+        print(f"[error] webhook POST failed: {e}")
+        return None
+    
+    if not r.ok:
+        print(f"[error] webhook POST returned HTTP {r.status_code}: {r.text[:300]}")
+        return None
+    
+    try:
+        return r.json()
+    except Exception:
+        print(f"[error] webhook POST didn't return JSON: {r.text[:300]}")
+        return None
 
 
 def dedupe_key(company, link):
@@ -205,17 +291,30 @@ def main():
     fresh = [i for i in items if i["link"] and i["link"] not in already_seen]
     print(f"After URL dedupe: {len(fresh)} new items to send to Gemini")
 
+    if len(fresh) > MAX_GEMINI_CALLS_PER_RUN:
+        print(f"Capping to {MAX_GEMINI_CALLS_PER_RUN} items this run (the rest will be picked up next run)")
+        fresh = fresh[:MAX_GEMINI_CALLS_PER_RUN]
+
     new_rows = []
-    for item in fresh:
+    for i, item in enumerate(fresh, 1):
+        print(f"[{i}/{len(fresh)}] {item['title'][:70]}")
         data = extract(client, item)
+        
+        if data == "DAILY_QUOTA":
+            break
+        
         if should_include(data):
             new_rows.append(build_row(data, item))
-            print(f"  + {data.get('company')} ({data.get('stage')}) - score {data.get('gtm_fit_score')}")
+            print(f"  + KEPT: {data.get('company')} ({data.get('stage')}) — score {data.get('gtm_fit_score')}")
+        
         time.sleep(GEMINI_RATE_DELAY_SEC)
 
     if new_rows:
         result = append_rows(new_rows)
-        print(f"\nWebhook response: {result}")
+        if result and result.get("ok"):
+            print(f"\nAppended {result.get('appended')} new rows to sheet")
+        else:
+            print(f"\n[warn] failed to append rows: {result}")
     else:
         print("\nNo new qualifying rows this run")
 
