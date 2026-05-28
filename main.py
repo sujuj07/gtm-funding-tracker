@@ -59,8 +59,8 @@ MAX_RETRIES_PER_ITEM = 2
 # Per-run cap to fit inside the 20-min GitHub Actions timeout.
 # 60 items x 15s = 15 min, leaving margin. Daily RPD (1,000) is not the
 # constraint — the per-run timeout is. Leftover items get picked up next run.
-MAX_ITEMS_PER_FEED = 12
-MAX_CALLS_PER_RUN = 60
+MAX_ITEMS_PER_FEED = 6
+MAX_CALLS_PER_RUN = 40
 
 
 # ----- Prompt -----
