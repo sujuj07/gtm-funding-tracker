@@ -1,0 +1,29 @@
+name: backfill-funding-rounds
+
+on:
+  # Manual trigger only — run this from the Actions tab when you want to
+  # process historical funding rounds. Re-run across multiple days to chew
+  # through the backlog within the free-tier Gemini quota.
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run backfill
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
+        run: python backfill.py
