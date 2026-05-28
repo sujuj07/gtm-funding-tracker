@@ -237,8 +237,18 @@ def dedupe_key(company, link):
 def build_row(data, item):
     hq = ", ".join(filter(None, [data.get("hq_city"), data.get("hq_country")]))
     website = (data.get("website_guess") or "").rstrip("/")
+    # Use the article's published date (when the round was reported), not today.
+    # Falls back to today only if the feed didn't supply a parseable date.
+    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        if item.get("published"):
+            parsed = feedparser._parse_date(item["published"])
+            if parsed:
+                date_str = time.strftime("%Y-%m-%d", parsed)
+    except Exception:
+        pass
     return [
-        datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        date_str,
         data.get("company", ""),
         data.get("stage", ""),
         data.get("amount_usd", ""),
