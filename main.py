@@ -38,6 +38,10 @@ RSS_SOURCES = [
     "https://inc42.com/buzz/feed/",
     "https://entrackr.com/feed/",
     "https://sifted.eu/feed",
+    # Crypto / Web3 / DePIN sources
+    "https://decrypt.co/feed",
+    "https://cointelegraph.com/rss",
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
 ]
 
 MIN_GTM_SCORE = 5
@@ -90,6 +94,8 @@ Scoring guide for gtm_fit_score (how good a GTM-role target is this company righ
 - 3-4: Pre-seed B2B (founder still doing GTM themselves), OR B2C with strong growth team need
 - 1-2: B2C without clear GTM need, very early-stage exploration, niche deeptech
 - 0: Acquihires, market commentary, layoff news, IPO filings, fund announcements, leadership changes, pure research
+
+For crypto / web3 / blockchain / DePIN companies: treat ecosystem BD, developer relations, growth, and partnerships as valid GTM functions. Score them on the same scale even if they're protocol- or token-based rather than classic B2B SaaS, and set is_b2b true if they sell to or partner with other businesses/developers.
 
 If this isn't a funding round (acquisition, product news, opinion piece, market commentary, layoff/leadership news, IPO filing), return: {"is_funding_round": false}
 
@@ -154,6 +160,17 @@ def extract(client, item):
     return None
 
 
+CRYPTO_KEYWORDS = {
+    "crypto", "web3", "blockchain", "defi", "depin",
+    "token", "onchain", "on-chain", "decentralized", "stablecoin",
+}
+
+
+def is_crypto(data):
+    haystack = f"{(data.get('sector') or '')} {(data.get('one_liner') or '')}".lower()
+    return any(kw in haystack for kw in CRYPTO_KEYWORDS)
+
+
 def should_include(data):
     if not data:
         return False
@@ -161,7 +178,9 @@ def should_include(data):
         return False
     if data.get("gtm_fit_score", 0) < MIN_GTM_SCORE:
         return False
-    if not data.get("is_b2b"):
+    # Crypto/web3/DePIN companies have BD/devrel/ecosystem GTM roles even when
+    # they're not classic B2B — let them through regardless of the B2B flag.
+    if not data.get("is_b2b") and not is_crypto(data):
         return False
     if data.get("stage") not in QUALIFYING_STAGES:
         return False
