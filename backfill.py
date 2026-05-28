@@ -27,10 +27,10 @@ GROQ_KEY = os.environ["GROQ_API_KEY"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 WEBHOOK_TOKEN = os.environ["WEBHOOK_TOKEN"]
 
-MODEL = "llama-3.3-70b-versatile"
+MODEL = "llama-3.1-8b-instant"
 
 # ====== EDIT THESE TWO LINES TO SET YOUR BACKFILL WINDOW ======
-DATE_FROM = "2026-03-01"   # earliest date to pull from
+DATE_FROM = "2026-04-15"   # earliest date to pull from
 DATE_TO = "2026-05-28"     # latest date (usually today)
 # ==============================================================
 
@@ -39,6 +39,11 @@ SEARCH_QUERIES = [
     "startup Series A funding",
     "startup Series B funding",
     "startup seed funding round",
+    # Crypto / Web3 / DePIN
+    "crypto startup raises funding",
+    "web3 startup funding round",
+    "blockchain startup funding",
+    "DePIN startup funding",
 ]
 
 WINDOW_DAYS = 14
@@ -50,9 +55,11 @@ QUALIFYING_STAGES = {
     "Series D+", "Growth",
 }
 
-RATE_DELAY_SEC = 15
+# 8B model free tier: 30,000 tokens/min, 14,400 requests/day. Each call
+# ~1,350 tokens -> ~22 calls/min max. 4s delay = 15/min, safely under.
+RATE_DELAY_SEC = 4
 MAX_RETRIES_PER_ITEM = 2
-MAX_CALLS_PER_RUN = 60       # fits in 20-min Actions timeout; re-run for more
+MAX_CALLS_PER_RUN = 500      # high enough to clear the whole backlog in one run
 MAX_ITEMS_PER_QUERY = 20
 
 
@@ -85,6 +92,8 @@ Scoring guide for gtm_fit_score (how good a GTM-role target is this company righ
 - 3-4: Pre-seed B2B (founder still doing GTM themselves), OR B2C with strong growth team need
 - 1-2: B2C without clear GTM need, very early-stage exploration, niche deeptech
 - 0: Acquihires, market commentary, layoff news, IPO filings, fund announcements, leadership changes, pure research
+
+For crypto / web3 / blockchain / DePIN companies: treat ecosystem BD, developer relations, growth, and partnerships as valid GTM functions. Score them on the same scale even if they're protocol- or token-based rather than classic B2B SaaS, and set is_b2b true if they sell to or partner with other businesses/developers.
 
 If this isn't a funding round, return: {"is_funding_round": false}
 
@@ -166,6 +175,17 @@ def extract(client, item):
     return None
 
 
+CRYPTO_KEYWORDS = {
+    "crypto", "web3", "blockchain", "defi", "depin",
+    "token", "onchain", "on-chain", "decentralized", "stablecoin",
+}
+
+
+def is_crypto(data):
+    haystack = f"{(data.get('sector') or '')} {(data.get('one_liner') or '')}".lower()
+    return any(kw in haystack for kw in CRYPTO_KEYWORDS)
+
+
 def should_include(data):
     if not data:
         return False
@@ -173,7 +193,7 @@ def should_include(data):
         return False
     if data.get("gtm_fit_score", 0) < MIN_GTM_SCORE:
         return False
-    if not data.get("is_b2b"):
+    if not data.get("is_b2b") and not is_crypto(data):
         return False
     if data.get("stage") not in QUALIFYING_STAGES:
         return False
