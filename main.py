@@ -28,9 +28,9 @@ GROQ_KEY = os.environ["GROQ_API_KEY"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 WEBHOOK_TOKEN = os.environ["WEBHOOK_TOKEN"]
 
-# Llama 3.3 70B: high quality, 1,000 requests/day free tier.
-# Alternative: "llama-3.1-8b-instant" (14,400/day, faster, slightly lower quality)
-MODEL = "llama-3.3-70b-versatile"
+# 8B model: 30,000 tokens/min, 14,400 requests/day free tier — fast enough
+# to clear a daily run in minutes. (Backfill uses the same model.)
+MODEL = "llama-3.1-8b-instant"
 
 RSS_SOURCES = [
     "https://techcrunch.com/category/venture/feed/",
@@ -51,9 +51,9 @@ QUALIFYING_STAGES = {
     "Series D+", "Growth",
 }
 
-# Groq free tier for llama-3.3-70b: 6,000 tokens/min. Each call ~1,350 tokens,
-# so ~4.4 calls/min max. 15s delay = ~4/min, safely under the TPM cap.
-RATE_DELAY_SEC = 15
+# 8B free tier: 30,000 tokens/min. Each call ~1,350 tokens -> ~22/min max.
+# 4s delay = 15/min, safely under the limit.
+RATE_DELAY_SEC = 4
 MAX_RETRIES_PER_ITEM = 2
 
 # Per-run cap to fit inside the 20-min GitHub Actions timeout.
@@ -187,6 +187,29 @@ def should_include(data):
     return True
 
 
+def fetch_existing_companies():
+    try:
+        r = requests.get(
+            WEBHOOK_URL,
+            params={"token": WEBHOOK_TOKEN, "action": "existing_companies"},
+            timeout=30,
+        )
+        data = r.json()
+        if data.get("ok"):
+            return set(data.get("companies", []))
+    except Exception as e:
+        print(f"[warn] couldn't fetch existing companies: {e}")
+    return set()
+
+
+def normalize_company(name):
+    import re as _re
+    s = (name or "").lower()
+    s = _re.sub(r"\b(inc|llc|ltd|corp|co|labs|technologies|technology|ai|io)\b", "", s)
+    s = _re.sub(r"[^a-z0-9]", "", s)
+    return s.strip()
+
+
 def fetch_existing_sources():
     try:
         r = requests.get(
@@ -273,7 +296,8 @@ def build_row(data, item):
 def main():
     client = Groq(api_key=GROQ_KEY)
     already_seen = fetch_existing_sources()
-    print(f"Already in sheet: {len(already_seen)} source URLs")
+    existing_companies = fetch_existing_companies()
+    print(f"Already in sheet: {len(already_seen)} source URLs, {len(existing_companies)} companies")
 
     items = fetch_items()
     print(f"Fetched {len(items)} items from {len(RSS_SOURCES)} feeds")
@@ -286,18 +310,26 @@ def main():
         fresh = fresh[:MAX_CALLS_PER_RUN]
 
     new_rows = []
+    seen_companies_this_run = set(existing_companies)
     for i, item in enumerate(fresh, 1):
         print(f"[{i}/{len(fresh)}] {item['title'][:70]}")
         data = extract(client, item)
         if should_include(data):
-            new_rows.append(build_row(data, item))
-            print(f"  + KEPT: {data.get('company')} ({data.get('stage')}) — score {data.get('gtm_fit_score')}")
+            norm = normalize_company(data.get("company"))
+            if norm and norm in seen_companies_this_run:
+                print(f"  ~ skip duplicate company: {data.get('company')}")
+            else:
+                if norm:
+                    seen_companies_this_run.add(norm)
+                new_rows.append(build_row(data, item))
+                print(f"  + KEPT: {data.get('company')} ({data.get('stage')}) — score {data.get('gtm_fit_score')}")
         time.sleep(RATE_DELAY_SEC)
 
     if new_rows:
         result = append_rows(new_rows)
         if result and result.get("ok"):
-            print(f"\nAppended {result.get('appended')} new rows to sheet")
+            print(f"\nAppended {result.get('appended')} new rows to sheet "
+                  f"(webhook skipped {result.get('skipped', 0)} dupes)")
         else:
             print(f"\n[warn] failed to append rows: {result}")
     else:
