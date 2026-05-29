@@ -30,8 +30,8 @@ WEBHOOK_TOKEN = os.environ["WEBHOOK_TOKEN"]
 MODEL = "llama-3.1-8b-instant"
 
 # ====== EDIT THESE TWO LINES TO SET YOUR BACKFILL WINDOW ======
-DATE_FROM = "2026-04-15"   # earliest date to pull from
-DATE_TO = "2026-05-28"     # latest date (usually today)
+DATE_FROM = "2026-04-01"   # earliest date to pull from
+DATE_TO = "2026-05-29"     # latest date (usually today)
 # ==============================================================
 
 SEARCH_QUERIES = [
