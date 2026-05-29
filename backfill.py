@@ -55,11 +55,18 @@ QUALIFYING_STAGES = {
     "Series D+", "Growth",
 }
 
-# 8B model free tier: 30,000 tokens/min, 14,400 requests/day. Each call
-# ~1,350 tokens -> ~22 calls/min max. 4s delay = 15/min, safely under.
-RATE_DELAY_SEC = 4
+# Save progress to the sheet every N items so timeouts don't lose work.
+# Combined with company-level dedupe, subsequent runs cleanly resume.
+SAVE_BATCH_SIZE = 20
+
+# 5s delay = 12/min, comfortably under the 8B free-tier TPM/RPM limits with
+# headroom for retries on busy moments.
+RATE_DELAY_SEC = 5
 MAX_RETRIES_PER_ITEM = 2
-MAX_CALLS_PER_RUN = 500      # high enough to clear the whole backlog in one run
+
+# 150 items x 5s = ~12 min processing + ~5 min for feed fetching = ~17 min.
+# Well under any reasonable timeout. Re-run 2-3x to clear a 3-month backlog.
+MAX_CALLS_PER_RUN = 150
 MAX_ITEMS_PER_QUERY = 20
 
 
@@ -283,23 +290,41 @@ def main():
         print(f"Capping to {MAX_CALLS_PER_RUN} this run — re-run to continue the backlog")
         fresh = fresh[:MAX_CALLS_PER_RUN]
 
-    new_rows = []
-    for i, item in enumerate(fresh, 1):
-        print(f"[{i}/{len(fresh)}] {item['title'][:70]}")
-        data = extract(client, item)
-        if should_include(data):
-            new_rows.append(build_row(data, item))
-            print(f"  + KEPT: {data.get('company')} ({data.get('stage')}) — score {data.get('gtm_fit_score')}")
-        time.sleep(RATE_DELAY_SEC)
+    pending = []          # rows accumulated since last save
+    total_saved = 0       # cumulative saved this run
 
-    if new_rows:
-        result = append_rows(new_rows)
+    def flush(reason):
+        nonlocal pending, total_saved
+        if not pending:
+            return
+        result = append_rows(pending)
         if result and result.get("ok"):
-            print(f"\nAppended {result.get('appended')} rows. Re-run to process more.")
+            n = result.get("appended", 0)
+            skipped = result.get("skipped", 0)
+            total_saved += n
+            print(f"  [save:{reason}] flushed {n} rows (webhook dedupe skipped {skipped}). Total this run: {total_saved}")
         else:
-            print(f"\n[warn] append failed: {result}")
-    else:
-        print("\nNo new qualifying rows this run")
+            print(f"  [save:{reason}] FAILED to flush — keeping rows in memory: {result}")
+            return  # don't clear pending so we retry next flush
+        pending = []
+
+    try:
+        for i, item in enumerate(fresh, 1):
+            print(f"[{i}/{len(fresh)}] {item['title'][:70]}")
+            data = extract(client, item)
+            if should_include(data):
+                pending.append(build_row(data, item))
+                print(f"  + KEPT: {data.get('company')} ({data.get('stage')}) — score {data.get('gtm_fit_score')}")
+
+            # Save in batches so a timeout doesn't lose work
+            if len(pending) >= SAVE_BATCH_SIZE:
+                flush("batch")
+
+            time.sleep(RATE_DELAY_SEC)
+    finally:
+        # Always flush remaining pending rows, even on error/interrupt
+        flush("final")
+        print(f"\nDone. Saved {total_saved} rows this run. Re-run to process more of the backlog.")
 
 
 if __name__ == "__main__":
