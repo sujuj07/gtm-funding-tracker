@@ -62,6 +62,9 @@ MAX_RETRIES_PER_ITEM = 2
 MAX_ITEMS_PER_FEED = 6
 MAX_CALLS_PER_RUN = 40
 
+# Save to sheet every N items so a timeout doesn't lose progress.
+SAVE_BATCH_SIZE = 20
+
 
 # ----- Prompt -----
 
@@ -309,31 +312,49 @@ def main():
         print(f"Capping to {MAX_CALLS_PER_RUN} items this run (rest picked up next run)")
         fresh = fresh[:MAX_CALLS_PER_RUN]
 
-    new_rows = []
+    pending = []
+    total_saved = 0
     seen_companies_this_run = set(existing_companies)
-    for i, item in enumerate(fresh, 1):
-        print(f"[{i}/{len(fresh)}] {item['title'][:70]}")
-        data = extract(client, item)
-        if should_include(data):
-            norm = normalize_company(data.get("company"))
-            if norm and norm in seen_companies_this_run:
-                print(f"  ~ skip duplicate company: {data.get('company')}")
-            else:
-                if norm:
-                    seen_companies_this_run.add(norm)
-                new_rows.append(build_row(data, item))
-                print(f"  + KEPT: {data.get('company')} ({data.get('stage')}) — score {data.get('gtm_fit_score')}")
-        time.sleep(RATE_DELAY_SEC)
 
-    if new_rows:
-        result = append_rows(new_rows)
+    def flush(reason):
+        nonlocal pending, total_saved
+        if not pending:
+            return
+        result = append_rows(pending)
         if result and result.get("ok"):
-            print(f"\nAppended {result.get('appended')} new rows to sheet "
-                  f"(webhook skipped {result.get('skipped', 0)} dupes)")
+            n = result.get("appended", 0)
+            skipped = result.get("skipped", 0)
+            total_saved += n
+            print(f"  [save:{reason}] flushed {n} rows (webhook dedupe skipped {skipped}). Total this run: {total_saved}")
         else:
-            print(f"\n[warn] failed to append rows: {result}")
-    else:
-        print("\nNo new qualifying rows this run")
+            print(f"  [save:{reason}] FAILED — keeping rows in memory: {result}")
+            return
+        pending = []
+
+    try:
+        for i, item in enumerate(fresh, 1):
+            print(f"[{i}/{len(fresh)}] {item['title'][:70]}")
+            data = extract(client, item)
+            if should_include(data):
+                norm = normalize_company(data.get("company"))
+                if norm and norm in seen_companies_this_run:
+                    print(f"  ~ skip duplicate company: {data.get('company')}")
+                else:
+                    if norm:
+                        seen_companies_this_run.add(norm)
+                    pending.append(build_row(data, item))
+                    print(f"  + KEPT: {data.get('company')} ({data.get('stage')}) — score {data.get('gtm_fit_score')}")
+
+            if len(pending) >= SAVE_BATCH_SIZE:
+                flush("batch")
+
+            time.sleep(RATE_DELAY_SEC)
+    finally:
+        flush("final")
+        if total_saved == 0:
+            print("\nNo new qualifying rows this run")
+        else:
+            print(f"\nDone. Saved {total_saved} rows this run.")
 
 
 if __name__ == "__main__":
