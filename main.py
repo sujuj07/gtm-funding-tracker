@@ -167,15 +167,19 @@ def extract(client, item):
 CRYPTO_KEYWORDS = {
     "crypto", "web3", "blockchain", "defi", "depin",
     "token", "onchain", "on-chain", "decentralized", "stablecoin",
+    "protocol", "nft", "dao", "l1", "l2", "layer 2", "layer 1",
+    "wallet", "exchange", "dex", "cefi",
 }
 
 
-def is_crypto(data):
+def is_crypto(data, item=None):
     haystack = f"{(data.get('sector') or '')} {(data.get('one_liner') or '')}".lower()
+    if item:
+        haystack += f" {(item.get('title') or '')}".lower()
     return any(kw in haystack for kw in CRYPTO_KEYWORDS)
 
 
-def should_include(data):
+def should_include(data, item=None):
     if not data:
         return False
     if not data.get("is_funding_round"):
@@ -184,7 +188,7 @@ def should_include(data):
         return False
     # Crypto/web3/DePIN companies have BD/devrel/ecosystem GTM roles even when
     # they're not classic B2B — let them through regardless of the B2B flag.
-    if not data.get("is_b2b") and not is_crypto(data):
+    if not data.get("is_b2b") and not is_crypto(data, item):
         return False
     if data.get("stage") not in QUALIFYING_STAGES:
         return False
@@ -335,7 +339,7 @@ def main():
         for i, item in enumerate(fresh, 1):
             print(f"[{i}/{len(fresh)}] {item['title'][:70]}")
             data = extract(client, item)
-            if should_include(data):
+            if should_include(data, item):
                 norm = normalize_company(data.get("company"))
                 if norm and norm in seen_companies_this_run:
                     print(f"  ~ skip duplicate company: {data.get('company')}")
