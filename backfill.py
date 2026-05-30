@@ -35,15 +35,15 @@ DATE_TO = "2026-05-29"     # latest date (usually today)
 # ==============================================================
 
 SEARCH_QUERIES = [
-    "startup raises funding round",
-    "startup Series A funding",
-    "startup Series B funding",
+    "startup raises Series A",
+    "startup raises Series B",
     "startup seed funding round",
-    # Crypto / Web3 / DePIN
-    "crypto startup raises funding",
-    "web3 startup funding round",
-    "blockchain startup funding",
-    "DePIN startup funding",
+    "startup raises funding round",
+    # Crypto-specific (using the language crypto media actually uses)
+    "crypto raises funding round",
+    "blockchain protocol raises",
+    "DeFi raises Series",
+    "web3 raises seed round",
 ]
 
 WINDOW_DAYS = 14
@@ -55,19 +55,14 @@ QUALIFYING_STAGES = {
     "Series D+", "Growth",
 }
 
-# Save progress to the sheet every N items so timeouts don't lose work.
-# Combined with company-level dedupe, subsequent runs cleanly resume.
-SAVE_BATCH_SIZE = 20
+SAVE_BATCH_SIZE = 15
 
-# 5s delay = 12/min, comfortably under the 8B free-tier TPM/RPM limits with
-# headroom for retries on busy moments.
+# Keep runs short enough to finish cleanly. 80 items × 5s = ~7 min processing.
+# Feed fetching adds ~3-5 min. Total ~12 min, well under 30 min timeout.
 RATE_DELAY_SEC = 5
-MAX_RETRIES_PER_ITEM = 2
-
-# 150 items x 5s = ~12 min processing + ~5 min for feed fetching = ~17 min.
-# Well under any reasonable timeout. Re-run 2-3x to clear a 3-month backlog.
-MAX_CALLS_PER_RUN = 150
-MAX_ITEMS_PER_QUERY = 20
+MAX_RETRIES_PER_ITEM = 1
+MAX_CALLS_PER_RUN = 80
+MAX_ITEMS_PER_QUERY = 15
 
 
 EXTRACTION_PROMPT = """You are evaluating a startup news item for someone hunting GTM (sales, growth, marketing, partnerships, BD, revops) roles at funded startups.
@@ -186,22 +181,26 @@ def extract(client, item):
 CRYPTO_KEYWORDS = {
     "crypto", "web3", "blockchain", "defi", "depin",
     "token", "onchain", "on-chain", "decentralized", "stablecoin",
+    "protocol", "nft", "dao", "l1", "l2", "layer 2", "layer 1",
+    "wallet", "exchange", "dex", "cefi",
 }
 
 
-def is_crypto(data):
+def is_crypto(data, item=None):
     haystack = f"{(data.get('sector') or '')} {(data.get('one_liner') or '')}".lower()
+    if item:
+        haystack += f" {(item.get('title') or '')}".lower()
     return any(kw in haystack for kw in CRYPTO_KEYWORDS)
 
 
-def should_include(data):
+def should_include(data, item=None):
     if not data:
         return False
     if not data.get("is_funding_round"):
         return False
     if data.get("gtm_fit_score", 0) < MIN_GTM_SCORE:
         return False
-    if not data.get("is_b2b") and not is_crypto(data):
+    if not data.get("is_b2b") and not is_crypto(data, item):
         return False
     if data.get("stage") not in QUALIFYING_STAGES:
         return False
@@ -313,7 +312,7 @@ def main():
         for i, item in enumerate(fresh, 1):
             print(f"[{i}/{len(fresh)}] {item['title'][:70]}")
             data = extract(client, item)
-            if should_include(data):
+            if should_include(data, item):
                 pending.append(build_row(data, item))
                 print(f"  + KEPT: {data.get('company')} ({data.get('stage')}) — score {data.get('gtm_fit_score')}")
 
