@@ -145,6 +145,7 @@ def fetch_historical_items():
                             "body": strip_html(entry.get("summary", ""))[:2000],
                             "link": link,
                             "published": entry.get("published", ""),
+                            "published_parsed": entry.get("published_parsed"),
                         })
             except Exception as e:
                 print(f"[warn] query failed ({query}, {after}-{before}): {e}")
@@ -243,12 +244,12 @@ def dedupe_key(company, link):
 def build_row(data, item):
     hq = ", ".join(filter(None, [data.get("hq_city"), data.get("hq_country")]))
     website = (data.get("website_guess") or "").rstrip("/")
+    # Use the article's actual publish date, not today
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
-        if item.get("published"):
-            parsed = feedparser._parse_date(item["published"])
-            if parsed:
-                date_str = time.strftime("%Y-%m-%d", parsed)
+        pp = item.get("published_parsed")
+        if pp:
+            date_str = time.strftime("%Y-%m-%d", pp)
     except Exception:
         pass
     return [
