@@ -123,6 +123,7 @@ def fetch_items():
                     "body": strip_html(entry.get("summary", ""))[:2000],
                     "link": entry.get("link", ""),
                     "published": entry.get("published", ""),
+                    "published_parsed": entry.get("published_parsed"),
                     "source_feed": url,
                 })
         except Exception as e:
@@ -267,10 +268,9 @@ def build_row(data, item):
     # Falls back to today only if the feed didn't supply a parseable date.
     date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
-        if item.get("published"):
-            parsed = feedparser._parse_date(item["published"])
-            if parsed:
-                date_str = time.strftime("%Y-%m-%d", parsed)
+        pp = item.get("published_parsed")
+        if pp:
+            date_str = time.strftime("%Y-%m-%d", pp)
     except Exception:
         pass
     return [
