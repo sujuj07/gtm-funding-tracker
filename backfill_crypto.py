@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from tracker_common import (
     MODEL_CHAIN_LABEL, event_key, extract_json, fetch_google_news, fetch_official_social_links, fetch_rss_feed, groq_client,
-    parse_event_date, post_rows, published_timestamp, verify_crypto_launch_quality, webhook_get,
+    launch_signal_score, parse_event_date, post_rows, published_timestamp, verify_crypto_launch_quality, webhook_get,
 )
 from backfill_state import advance_window, choose_window, end_exclusive_today, leave_window_pending
 
@@ -19,15 +19,20 @@ MAX_ITEMS_PER_RUN = int(os.getenv("BACKFILL_MAX_ITEMS_PER_RUN", "60"))
 SAVE_BATCH_SIZE = int(os.getenv("SAVE_BATCH_SIZE", "10"))
 DELAY = float(os.getenv("MODEL_DELAY_SECONDS", "2.5"))
 QUERIES = [
-    "crypto startup announces launch new protocol mainnet testnet",
-    "web3 startup announces launch new platform project",
-    "new blockchain protocol mainnet launch crypto",
-    "new DeFi protocol launches crypto project",
-    '"we are launching" crypto protocol web3',
-    '"introducing" "mainnet" crypto startup',
-    "new crypto project launch announcement protocol dApp",
-    "new blockchain company launches wallet infrastructure",
-    "new blockchain infrastructure startup launch Web3 developer tools wallet security",
+    '"mainnet launch" crypto protocol',
+    '"testnet launch" Web3 protocol',
+    '"mainnet is live" blockchain project',
+    '"testnet is live" blockchain project',
+    '"launches new protocol" DeFi blockchain',
+    '"launches a new blockchain" startup',
+    '"introducing" "Web3 protocol" launch',
+    '"new DeFi protocol" launches',
+    '"public beta" Web3 protocol launch',
+    'site:chainwire.org blockchain protocol launch',
+    'site:globenewswire.com Web3 protocol launch',
+    'site:prnewswire.com blockchain protocol launch',
+    '"launching today" crypto protocol',
+    '"protocol launch" blockchain startup',
 ]
 
 PROMPT = r"""You are the first-stage triage analyst for a selective crypto/Web3 launch radar. Return JSON only:
@@ -116,10 +121,23 @@ def main():
     print(f"Crypto launch historical backfill | strict-founder-gate=on | {window_start} <= dates < {window_end} | current target end={DATE_TO} | model-route={MODEL_CHAIN_LABEL}")
     all_items, search_incomplete = collect(window_start, window_end)
     existing_sources = webhook_get(STREAM, "existing_sources")
-    fresh_all = [x for x in all_items if x.get("link") and x["link"] not in existing_sources]
+    raw_fresh = [x for x in all_items if x.get("link") and x["link"] not in existing_sources]
+    # Avoid wasting model quota triaging generic crypto news. Only articles with
+    # a visible product/network launch cue proceed to LLM classification.
+    fresh_all = [x for x in raw_fresh if launch_signal_score(x) > 0]
+    fresh_all.sort(key=lambda x: (launch_signal_score(x), published_timestamp(x)), reverse=True)
+    screened_out = len(raw_fresh) - len(fresh_all)
     more_candidates = len(fresh_all) > MAX_ITEMS_PER_RUN
     fresh = fresh_all[:MAX_ITEMS_PER_RUN]
-    print(f"Collected {len(all_items)} distinct source URLs; {len(fresh_all)} unprocessed candidates, processing {len(fresh)} (cap={MAX_ITEMS_PER_RUN})")
+    print(
+        f"Collected {len(all_items)} distinct source URLs; {len(raw_fresh)} new/unprocessed; "
+        f"screened out {screened_out} low-signal headlines before model triage; "
+        f"{len(fresh_all)} launch-like candidates, processing {len(fresh)} (cap={MAX_ITEMS_PER_RUN})"
+    )
+    if screened_out:
+        examples = [str(x.get("title", ""))[:90] for x in raw_fresh if launch_signal_score(x) == 0][:3]
+        for example in examples:
+            print(f"  [prefilter] no clear launch cue: {example}")
     client = groq_client()
     pending, processed, appended, updated = [], [], 0, 0
     flush_unconfirmed = False
@@ -195,7 +213,7 @@ def main():
     elif search_incomplete:
         leave_window_pending(window_start, window_end, "one or more search queries failed; retrying the same date window for complete coverage")
     elif more_candidates:
-        leave_window_pending(window_start, window_end, f"{len(fresh_all) - len(fresh)} fresh candidate(s) remain for this week")
+        leave_window_pending(window_start, window_end, f"{len(fresh_all) - len(fresh)} launch-like candidate(s) remain for this week")
     elif flush_unconfirmed:
         leave_window_pending(window_start, window_end, "webhook write was not confirmed")
     else:

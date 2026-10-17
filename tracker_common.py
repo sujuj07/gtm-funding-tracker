@@ -162,6 +162,54 @@ def published_timestamp(item: dict) -> float:
         return 0.0
 
 
+
+# High-signal launch detection used before spending model tokens. This is a
+# conservative recall/precision balance: obvious generic crypto-news headlines
+# do not reach LLM triage unless their headline/body contains a substantive
+# product/network launch cue.
+_LAUNCH_CUE_RE = re.compile(
+    r"\b(?:launch(?:es|ed|ing)?|mainnet|testnet|goes live|went live|now live|is live|we are live|we\'re live|live now|"
+    r"introduc(?:es|ed|ing|tion)|unveil(?:s|ed|ing)?|debut(?:s|ed)?|rolls? out|"
+    r"release[sd]?|ships?|shipping|public beta|open beta|early access|available now|"
+    r"goes public|opens to the public|network launch|protocol launch|product launch)\b",
+    re.IGNORECASE,
+)
+_TECH_CONTEXT_RE = re.compile(
+    r"\b(?:crypto|web3|web 3|blockchain|protocol|mainnet|testnet|defi|onchain|"
+    r"layer[- ]?[123]|\bL[123]\b|wallet|smart contract|stablecoin|decentralized|"
+    r"decentralised|rollup|validator|dapp|infrastructure|tokenization|tokenisation)\b",
+    re.IGNORECASE,
+)
+_NOISE_ONLY_RE = re.compile(
+    r"\b(?:funding round|raises? \$|raised \$|series [a-f]|seed round|token price|"
+    r"price prediction|price surges?|ETF|moves? \$|transfers? \$|business officer|"
+    r"appoints?|joins? as|acquires?|acquisition|hiring|job opening|validator group)\b",
+    re.IGNORECASE,
+)
+
+
+def launch_signal_score(item: dict[str, Any]) -> int:
+    """Return 0 for non-launch-like news, otherwise rank stronger launch evidence higher."""
+    title = strip_html(str(item.get("title") or ""))
+    body = strip_html(str(item.get("body") or ""))[:1800]
+    title_has_cue = bool(_LAUNCH_CUE_RE.search(title))
+    context = f"{title} {body}"
+    has_tech_context = bool(_TECH_CONTEXT_RE.search(context))
+
+    # Stop obvious fundraising, hiring, price/transfer and executive news from
+    # consuming triage calls unless its headline explicitly signals a launch.
+    if _NOISE_ONLY_RE.search(title) and not title_has_cue:
+        return 0
+    if title_has_cue and has_tech_context:
+        return 3
+    if _LAUNCH_CUE_RE.search(body) and has_tech_context:
+        return 2
+    # A new protocol/network/chain/product announcement can be phrased without
+    # the literal word "launch"; accept it at lower priority for model review.
+    if re.search(r"\b(?:new|introducing|announcing)\s+(?:a\s+)?(?:protocol|network|blockchain|layer[- ]?[123]|L1|L2|wallet|DeFi platform|Web3 platform)\b", title, re.I) and has_tech_context:
+        return 1
+    return 0
+
 def google_news_rss_url(query: str, after: str | None = None, before: str | None = None) -> str:
     parts = [query]
     if after:

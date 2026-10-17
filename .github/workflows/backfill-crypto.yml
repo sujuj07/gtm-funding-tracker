@@ -50,7 +50,7 @@ jobs:
           WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
           BACKFILL_DATE_FROM: "2026-08-01"
           BACKFILL_WINDOW_DAYS: "7"
-          BACKFILL_MAX_ITEMS_PER_RUN: ${{ github.event_name == 'schedule' && '2' || '6' }}
+          BACKFILL_MAX_ITEMS_PER_RUN: ${{ github.event_name == 'schedule' && '6' || '8' }}
         run: python backfill_crypto.py
       - name: Persist cursor on the default branch
         if: ${{ always() && (success() || (github.event_name == 'workflow_dispatch' && inputs.reset_cursor)) }}

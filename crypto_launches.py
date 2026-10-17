@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from tracker_common import (
     MODEL_CHAIN_LABEL, account_freshness, event_key, extract_json, fetch_google_news, fetch_rss_feed,
-    fetch_official_social_links, groq_client, parse_event_date, post_rows, verify_crypto_launch_quality,
+    fetch_official_social_links, groq_client, launch_signal_score, parse_event_date, post_rows, published_timestamp, verify_crypto_launch_quality,
     webhook_get, x_recent_search,
 )
 
@@ -20,13 +20,18 @@ RSS_SOURCES = [
     ("https://www.coindesk.com/arc/outboundfeeds/rss/", "CoinDesk"),
 ]
 NEWS_QUERIES = [
-    "crypto startup announces launch new protocol mainnet testnet",
-    "web3 startup announces launch crypto project new platform",
-    "new blockchain protocol launches mainnet crypto startup",
-    "new DeFi protocol launches crypto project website X",
-    '"we are launching" crypto protocol web3',
-    '"introducing" "mainnet" crypto startup',
-    "new blockchain infrastructure startup launch Web3 developer tools wallet security",
+    '"mainnet launch" crypto protocol',
+    '"testnet launch" Web3 protocol',
+    '"mainnet is live" blockchain project',
+    '"testnet is live" blockchain project',
+    '"launches new protocol" DeFi blockchain',
+    '"introducing" "Web3 protocol" launch',
+    '"new DeFi protocol" launches',
+    '"public beta" Web3 protocol launch',
+    'site:chainwire.org blockchain protocol launch',
+    'site:globenewswire.com Web3 protocol launch',
+    '"launching today" crypto protocol',
+    '"protocol launch" blockchain startup',
 ]
 X_QUERIES = [
     '(launching OR "we are live" OR "mainnet is live" OR "testnet is live" OR "introducing") (crypto OR web3 OR blockchain OR DeFi OR protocol OR wallet OR onchain) -is:retweet lang:en',
@@ -82,10 +87,16 @@ def main():
     print(f"Crypto launch radar | strict-founder-gate=on | model-route={MODEL_CHAIN_LABEL} | UTC={datetime.now(timezone.utc).isoformat()}")
     existing_sources = webhook_get(STREAM, "existing_sources")
     items = make_items()
-    fresh = [item for item in items if item.get("link") and item["link"] not in existing_sources]
-    fresh.sort(key=lambda item: item.get("published", ""), reverse=True)
-    fresh = fresh[:MAX_ITEMS_PER_RUN]
-    print(f"Fetched {len(items)} unique signals; {len(fresh)} new signals to classify")
+    raw_fresh = [item for item in items if item.get("link") and item["link"] not in existing_sources]
+    fresh_all = [item for item in raw_fresh if launch_signal_score(item) > 0]
+    fresh_all.sort(key=lambda item: (launch_signal_score(item), published_timestamp(item)), reverse=True)
+    screened_out = len(raw_fresh) - len(fresh_all)
+    fresh = fresh_all[:MAX_ITEMS_PER_RUN]
+    print(
+        f"Fetched {len(items)} unique signals; {len(raw_fresh)} new sources; "
+        f"screened out {screened_out} without a clear launch cue; "
+        f"{len(fresh_all)} launch-like signals, classifying {len(fresh)}"
+    )
 
     client = groq_client()
     pending, processed = [], []

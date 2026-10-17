@@ -113,3 +113,11 @@ The two backfill scripts can be run manually and use `.github/workflows/backfill
 - If an earlier version advanced the cursor too far, manually run the relevant workflow and set `reset_cursor` to `true`. It restarts scanning at 2026-08-01. Existing processed source URLs remain stored in the hidden Apps Script registry, preventing duplicate processing.
 - Once the backfill reaches today's target date, the workflow disables its own schedule; the separate hourly live-monitoring workflow continues. GitHub scheduled runs are best-effort and may be delayed.
 
+
+## Crypto Launch Radar discovery quality (v9)
+
+The crypto launch pipeline now searches more specific launch phrases and press-release queries, then applies a lightweight headline/body signal check before calling an LLM. This keeps general funding, price, transfer, executive, and market-news stories from consuming model quota unless they also contain a substantive product/network launch signal.
+
+Logs now report the raw source count, how many new sources were found, how many lacked a clear launch cue, and how many launch-like candidates were sent to the model. The founder and previous-shipped-Web3-project verification requirements remain strict; NFTs and meme projects remain excluded.
+
+To deploy: replace the matching repository files from the v9 patch, commit and push to `main`, then manually run `backfill-crypto-launch-radar` once. Do **not** reset the cursor for this patch. The current cursor remains at its pending week; the updated queries and prefilter will apply to that window. The backfill remains scheduled hourly, with a larger candidate cap now that irrelevant headlines are screened before model calls.
