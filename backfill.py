@@ -1,330 +1,178 @@
-"""
-Backfill historical funding rounds via Google News RSS date-range search.
-Groq version (Llama 3.3 70B, 1,000 requests/day free tier).
+"""Historical startup funding / formation / hiring backfill from 2026-08-01 onward.
 
-With Groq's 1,000/day quota you can process a full multi-month backfill in
-one or two runs instead of weeks of grinding. Edit DATE_FROM / DATE_TO,
-then run the backfill workflow from the Actions tab.
-
-Required env vars: GROQ_API_KEY, WEBHOOK_URL, WEBHOOK_TOKEN
+Run via GitHub Actions -> Backfill funding (manual). Re-run until it reports no new
+source candidates. Processed sources (including rejected results) are saved in the
+Apps Script so free-tier batches make forward progress rather than repeat work.
 """
 import os
-import re
-import json
 import time
-import hashlib
-import urllib.parse
 from datetime import datetime, timedelta, timezone
 
-import feedparser
-import requests
-from groq import Groq
+from tracker_common import (
+    MODEL, defillama_raises, event_key, extract_json, fetch_google_news,
+    groq_client, post_rows, webhook_get, norm_company, parse_event_date, published_timestamp,
+    excluded_nft_or_meme,
+)
 
+STREAM = "funding"
+DATE_FROM = os.getenv("BACKFILL_DATE_FROM", "2026-08-01")
+DATE_TO = os.getenv("BACKFILL_DATE_TO", (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat())  # exclusive
+WINDOW_DAYS = int(os.getenv("BACKFILL_WINDOW_DAYS", "7"))
+MAX_ITEMS_PER_QUERY = int(os.getenv("BACKFILL_ITEMS_PER_QUERY", "60"))
+MAX_ITEMS_PER_RUN = int(os.getenv("BACKFILL_MAX_ITEMS_PER_RUN", "60"))
+SAVE_BATCH_SIZE = int(os.getenv("SAVE_BATCH_SIZE", "10"))
+DELAY = float(os.getenv("MODEL_DELAY_SECONDS", "2.5"))
 
-# ----- Config -----
-
-GROQ_KEY = os.environ["GROQ_API_KEY"]
-WEBHOOK_URL = os.environ["WEBHOOK_URL"]
-WEBHOOK_TOKEN = os.environ["WEBHOOK_TOKEN"]
-
-MODEL = "llama-3.1-8b-instant"
-
-# ====== EDIT THESE TWO LINES TO SET YOUR BACKFILL WINDOW ======
-DATE_FROM = "2026-04-01"   # earliest date to pull from
-DATE_TO = "2026-05-29"     # latest date (usually today)
-# ==============================================================
-
-SEARCH_QUERIES = [
-    "startup raises Series A",
-    "startup raises Series B",
-    "startup seed funding round",
-    "startup raises funding round",
-    # Crypto-specific (using the language crypto media actually uses)
-    "crypto raises funding round",
-    "blockchain protocol raises",
-    "DeFi raises Series",
-    "web3 raises seed round",
+QUERIES = [
+    'startup raises funding seed OR Series AI artificial intelligence',
+    'AI startup funding round announced investors',
+    'deep tech startup raises funding robotics semiconductor quantum',
+    'deep technology company receives investment funding round',
+    'fintech startup raises seed Series funding payments lending',
+    'fintech company funding round investors global',
+    'crypto startup raises funding round blockchain web3',
+    'DeFi protocol raises funding round investors',
+    'new company incorporated AI startup founded launched',
+    'deep tech company founded incorporated startup launch',
+    'fintech company incorporated startup founded launch',
+    'crypto web3 company launch new startup protocol announced',
+    'AI startup hiring expansion jobs funded company',
+    'robotics startup funding round deep tech investment',
+    'climate tech energy storage battery startup raises funding',
+    'biotech tools scientific instruments startup raises funding',
 ]
 
-WINDOW_DAYS = 14
-
-MIN_GTM_SCORE = 5
-QUALIFYING_STAGES = {
-    "Pre-seed", "Seed", "Seed Extension",
-    "Series A", "Series B", "Series C",
-    "Series D+", "Growth",
-}
-
-SAVE_BATCH_SIZE = 15
-
-# Keep runs short enough to finish cleanly. 80 items × 5s = ~7 min processing.
-# Feed fetching adds ~3-5 min. Total ~12 min, well under 30 min timeout.
-RATE_DELAY_SEC = 5
-MAX_RETRIES_PER_ITEM = 1
-MAX_CALLS_PER_RUN = 80
-MAX_ITEMS_PER_QUERY = 15
-
-
-EXTRACTION_PROMPT = """You are evaluating a startup news item for someone hunting GTM (sales, growth, marketing, partnerships, BD, revops) roles at funded startups.
-
-Return ONLY a JSON object, no markdown, no commentary. Schema:
+PROMPT = r"""You are a careful startup intelligence analyst. Extract ONLY details supported by the supplied source. Do not infer exact funding amounts, dates, investors, founders, or product details without evidence. Return JSON only:
 {
-  "is_funding_round": true|false,
-  "company": "name",
-  "amount_usd": number or null,
-  "stage": "Pre-seed"|"Seed"|"Seed Extension"|"Series A"|"Series B"|"Series C"|"Series D+"|"Growth"|null,
-  "sector": "specific (e.g. 'B2B SaaS - HR tech', 'Fintech - lending', 'Vertical AI - legal')",
-  "is_b2b": true|false,
-  "is_customer_facing": true|false,
-  "hq_country": "country" or null,
-  "hq_city": "city" or null,
-  "lead_investor": "name" or null,
-  "founders": ["name1", "name2"],
-  "one_liner": "<15 words: what they do",
-  "website_guess": "https://...",
-  "gtm_fit_score": 0-10 integer (10 = ideal GTM job target: B2B, Series A-C, customer-facing, scaling),
-  "gtm_fit_reason": "<15 words why this score",
-  "open_gtm_roles_likely": true|false
+ "relevant": true,
+ "event_type": "Funding round|Company formation/incorporation|Hiring announcement|Other",
+ "event_date": "YYYY-MM-DD or null",
+ "company": "official company/project name",
+ "stage": "Pre-seed|Seed|Seed Extension|Series A|Series B|Series C|Series D+|Growth|Strategic|Grant|Debt|Unknown",
+ "amount_usd": number or null,
+ "valuation_usd": number or null,
+ "sector": "specific sector and sub-sector",
+ "crypto_project_category": "protocol/infrastructure|DeFi|developer tools|payments/stablecoin|NFT/collectibles|meme/memecoin|other|not applicable",
+ "is_nft_or_meme_project": false,
+ "broad_offerings": "products/services, 1-3 sentences",
+ "niche_presence": "specific technical/business niche, use case, specialization",
+ "product_type": "software|hardware|infrastructure|financial service|protocol|marketplace|other",
+ "target_customers": "customer types",
+ "one_liner": "concise summary",
+ "is_b2b": true,
+ "hq_country": "country or null",
+ "hq_city": "city or null",
+ "website": "official URL or null",
+ "founders": ["names only if stated"],
+ "lead_investor": "name or null",
+ "other_investors": ["names only if stated"],
+ "hiring_signal": "explicit hiring information or Unknown",
+ "confidence": "High|Medium|Low",
+ "evidence_note": "what this source establishes"
 }
+Include credible funding rounds, explicit company formation/incorporation, or substantive hiring announcements for AI, deep tech (robotics, semiconductors, quantum, biotech tooling, space, energy/climate hardware, scientific instruments, advanced materials), crypto/blockchain/Web3, or fintech globally. Include pre-seed and undisclosed rounds. For crypto/Web3 entries, exclude projects primarily built around NFTs, PFPs, collectibles, NFT marketplaces, meme coins or meme tokens. Exclude investor commentary, public market news, token prices, fund launches, and unrelated companies. Do not classify a company as NFT/meme-first just because it mentions those as a secondary use case. Return relevant=false for irrelevant stories. Never invent details; use null, empty arrays or Unknown where needed.
 
-Scoring guide for gtm_fit_score (how good a GTM-role target is this company right now?):
-- 9-10: Series A/B/C, B2B with clear ICP and product-market fit, scaling phase, recognizable lead VC, founder mentions hiring/growth
-- 7-8: Solid B2B at Series A+ but smaller raise, or niche sector with strong fundamentals
-- 5-6: Seed/Seed extension B2B with a real product, OR Series A+ in adjacent areas
-- 3-4: Pre-seed B2B (founder still doing GTM themselves), OR B2C with strong growth team need
-- 1-2: B2C without clear GTM need, very early-stage exploration, niche deeptech
-- 0: Acquihires, market commentary, layoff news, IPO filings, fund announcements, leadership changes, pure research
-
-For crypto / web3 / blockchain / DePIN companies: treat ecosystem BD, developer relations, growth, and partnerships as valid GTM functions. Score them on the same scale even if they're protocol- or token-based rather than classic B2B SaaS, and set is_b2b true if they sell to or partner with other businesses/developers.
-
-If this isn't a funding round, return: {"is_funding_round": false}
-
-Title: %TITLE%
-Body: %BODY%"""
+TITLE: {title}
+DATE: {source_date}
+PUBLISHER: {publisher}
+URL: {link}
+BODY: {body}
+"""
 
 
-def strip_html(text):
-    return re.sub(r"<[^>]+>", "", text or "").strip()
-
-
-def date_windows(date_from, date_to, window_days):
-    start = datetime.strptime(date_from, "%Y-%m-%d")
-    end = datetime.strptime(date_to, "%Y-%m-%d")
-    cur = start
+def date_windows(start: str, end_exclusive: str, window_days: int):
+    cur = datetime.strptime(start, "%Y-%m-%d").date()
+    end = datetime.strptime(end_exclusive, "%Y-%m-%d").date()
     while cur < end:
-        win_end = min(cur + timedelta(days=window_days), end)
-        yield cur.strftime("%Y-%m-%d"), win_end.strftime("%Y-%m-%d")
-        cur = win_end
+        next_day = min(cur + timedelta(days=window_days), end)
+        yield cur.isoformat(), next_day.isoformat()
+        cur = next_day
 
 
-def google_news_rss_url(query, after, before):
-    full_query = f"{query} after:{after} before:{before}"
-    encoded = urllib.parse.quote(full_query)
-    return f"https://news.google.com/rss/search?q={encoded}&hl=en-US&gl=US&ceid=US:en"
-
-
-def fetch_historical_items():
-    items = []
-    seen_links = set()
-    for after, before in date_windows(DATE_FROM, DATE_TO, WINDOW_DAYS):
-        for query in SEARCH_QUERIES:
-            url = google_news_rss_url(query, after, before)
-            try:
-                feed = feedparser.parse(url)
-                for entry in feed.entries[:MAX_ITEMS_PER_QUERY]:
-                    link = entry.get("link", "")
-                    if link and link not in seen_links:
-                        seen_links.add(link)
-                        items.append({
-                            "title": strip_html(entry.get("title", "")),
-                            "body": strip_html(entry.get("summary", ""))[:2000],
-                            "link": link,
-                            "published": entry.get("published", ""),
-                            "published_parsed": entry.get("published_parsed"),
-                        })
-            except Exception as e:
-                print(f"[warn] query failed ({query}, {after}-{before}): {e}")
-            time.sleep(1)
-    return items
-
-
-def extract(client, item):
-    prompt = EXTRACTION_PROMPT.replace("%TITLE%", item["title"]).replace("%BODY%", item["body"])
-    for attempt in range(MAX_RETRIES_PER_ITEM + 1):
-        try:
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                temperature=0.2,
-            )
-            text = response.choices[0].message.content or ""
-            return json.loads(text)
-        except Exception as e:
-            err_str = str(e)
-            if "429" in err_str or "rate" in err_str.lower() or "RateLimit" in err_str:
-                m = re.search(r"try again in ([\d.]+)s", err_str)
-                wait = (float(m.group(1)) + 1) if m else (20 * (attempt + 1))
-                wait = min(wait, 60)
-                print(f"  [retry] rate limited, waiting {wait:.0f}s")
-                time.sleep(wait)
-                continue
-            if "503" in err_str or "502" in err_str or "500" in err_str:
-                print("  [retry] Groq temporarily unavailable, waiting 15s")
-                time.sleep(15)
-                continue
-            print(f"[warn] extract failed for '{item['title'][:60]}': {e}")
-            return None
-    return None
-
-
-CRYPTO_KEYWORDS = {
-    "crypto", "web3", "blockchain", "defi", "depin",
-    "token", "onchain", "on-chain", "decentralized", "stablecoin",
-    "protocol", "nft", "dao", "l1", "l2", "layer 2", "layer 1",
-    "wallet", "exchange", "dex", "cefi",
-}
-
-
-def is_crypto(data, item=None):
-    haystack = f"{(data.get('sector') or '')} {(data.get('one_liner') or '')}".lower()
-    if item:
-        haystack += f" {(item.get('title') or '')}".lower()
-    return any(kw in haystack for kw in CRYPTO_KEYWORDS)
-
-
-def should_include(data, item=None):
-    if not data:
-        return False
-    if not data.get("is_funding_round"):
-        return False
-    if data.get("gtm_fit_score", 0) < MIN_GTM_SCORE:
-        return False
-    if not data.get("is_b2b") and not is_crypto(data, item):
-        return False
-    if data.get("stage") not in QUALIFYING_STAGES:
-        return False
-    return True
-
-
-def fetch_existing_sources():
-    try:
-        r = requests.get(
-            WEBHOOK_URL,
-            params={"token": WEBHOOK_TOKEN, "action": "existing_sources"},
-            timeout=30,
-        )
-        data = r.json()
-        if data.get("ok"):
-            return set(data.get("sources", []))
-        print(f"[warn] webhook GET returned: {data}")
-    except Exception as e:
-        print(f"[warn] couldn't fetch existing sources: {e}")
-    return set()
-
-
-def append_rows(rows):
-    try:
-        r = requests.post(WEBHOOK_URL, json={"token": WEBHOOK_TOKEN, "rows": rows}, timeout=60)
-        if not r.ok:
-            print(f"[error] webhook POST HTTP {r.status_code}: {r.text[:200]}")
-            return None
-        return r.json()
-    except Exception as e:
-        print(f"[error] webhook POST failed: {e}")
-        return None
-
-
-def dedupe_key(company, link):
-    raw = f"{(company or '').lower().strip()}|{link}"
-    return hashlib.md5(raw.encode()).hexdigest()[:12]
-
-
-def build_row(data, item):
-    hq = ", ".join(filter(None, [data.get("hq_city"), data.get("hq_country")]))
-    website = (data.get("website_guess") or "").rstrip("/")
-    # Use the article's actual publish date, not today
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    try:
-        pp = item.get("published_parsed")
-        if pp:
-            date_str = time.strftime("%Y-%m-%d", pp)
-    except Exception:
-        pass
-    return [
-        date_str,
-        data.get("company", ""),
-        data.get("stage", ""),
-        data.get("amount_usd", ""),
-        data.get("sector", ""),
-        hq,
-        data.get("one_liner", ""),
-        "B2B" if data.get("is_b2b") else "B2C",
-        data.get("gtm_fit_score", ""),
-        data.get("gtm_fit_reason", ""),
-        "Yes" if data.get("open_gtm_roles_likely") else "Maybe",
-        website,
-        f"{website}/careers" if website else "",
-        ", ".join(data.get("founders", []) or []),
-        data.get("lead_investor", ""),
-        item["link"],
-        "New",
-        "",
-        dedupe_key(data.get("company", ""), item["link"]),
-    ]
+def collect_items():
+    gathered = {}
+    for start, end in date_windows(DATE_FROM, DATE_TO, WINDOW_DAYS):
+        for query in QUERIES:
+            for item in fetch_google_news(query, after=start, before=end, limit=MAX_ITEMS_PER_QUERY):
+                if item.get("link"):
+                    gathered.setdefault(item["link"], item)
+            time.sleep(0.25)
+        print(f"  fetched historical search window {start} to {end}")
+    # DeFiLlama Raises covers crypto fundraises, but API integration is optional / Pro-only.
+    for item in defillama_raises():
+        dt = parse_event_date(item)
+        if dt != "Unknown" and DATE_FROM <= dt < DATE_TO and item.get("link"):
+            gathered.setdefault(item["link"], item)
+    return sorted(gathered.values(), key=published_timestamp, reverse=True)
 
 
 def main():
-    print(f"Backfilling funding rounds from {DATE_FROM} to {DATE_TO}")
-    client = Groq(api_key=GROQ_KEY)
-    already_seen = fetch_existing_sources()
-    print(f"Already in sheet: {len(already_seen)} source URLs")
+    print(f"Historical funding backfill | {DATE_FROM} <= dates < {DATE_TO} | model={MODEL}")
+    items = collect_items()
+    existing_sources = webhook_get(STREAM, "existing_sources")
+    existing_keys = webhook_get(STREAM, "existing_keys")
+    fresh = [item for item in items if item.get("link") and item["link"] not in existing_sources]
+    fresh = fresh[:MAX_ITEMS_PER_RUN]
+    print(f"Collected {len(items)} distinct article/event URLs; {len(fresh)} new candidates this run (cap={MAX_ITEMS_PER_RUN})")
 
-    items = fetch_historical_items()
-    print(f"Found {len(items)} unique historical items from Google News")
+    client = groq_client()
+    pending, processed = [], []
+    seen_keys = set(existing_keys)
+    appended = 0
+    updated = 0
 
-    fresh = [i for i in items if i["link"] and i["link"] not in already_seen]
-    print(f"After dedupe: {len(fresh)} new items")
-
-    if len(fresh) > MAX_CALLS_PER_RUN:
-        print(f"Capping to {MAX_CALLS_PER_RUN} this run — re-run to continue the backlog")
-        fresh = fresh[:MAX_CALLS_PER_RUN]
-
-    pending = []          # rows accumulated since last save
-    total_saved = 0       # cumulative saved this run
-
-    def flush(reason):
-        nonlocal pending, total_saved
-        if not pending:
+    def flush():
+        nonlocal pending, processed, appended, updated
+        if not pending and not processed:
             return
-        result = append_rows(pending)
+        result = post_rows(STREAM, pending, processed_sources=processed)
         if result and result.get("ok"):
-            n = result.get("appended", 0)
-            skipped = result.get("skipped", 0)
-            total_saved += n
-            print(f"  [save:{reason}] flushed {n} rows (webhook dedupe skipped {skipped}). Total this run: {total_saved}")
+            appended += result.get("appended", 0)
+            updated += result.get("updated", 0)
+            print(f"  [save] appended={result.get('appended', 0)} updated={result.get('updated', 0)} skipped={result.get('skipped', 0)}")
+            pending, processed = [], []
         else:
-            print(f"  [save:{reason}] FAILED to flush — keeping rows in memory: {result}")
-            return  # don't clear pending so we retry next flush
-        pending = []
+            print("  [warn] webhook did not confirm batch; retrying at end")
 
-    try:
-        for i, item in enumerate(fresh, 1):
-            print(f"[{i}/{len(fresh)}] {item['title'][:70]}")
-            data = extract(client, item)
-            if should_include(data, item):
-                pending.append(build_row(data, item))
-                print(f"  + KEPT: {data.get('company')} ({data.get('stage')}) — score {data.get('gtm_fit_score')}")
-
-            # Save in batches so a timeout doesn't lose work
-            if len(pending) >= SAVE_BATCH_SIZE:
-                flush("batch")
-
-            time.sleep(RATE_DELAY_SEC)
-    finally:
-        # Always flush remaining pending rows, even on error/interrupt
-        flush("final")
-        print(f"\nDone. Saved {total_saved} rows this run. Re-run to process more of the backlog.")
+    for idx, item in enumerate(fresh, 1):
+        date = parse_event_date(item)
+        prompt = PROMPT.replace("{title}", item.get("title", "")[:400])
+        prompt = prompt.replace("{source_date}", date).replace("{publisher}", item.get("publisher", "Unknown"))
+        prompt = prompt.replace("{link}", item.get("link", "")).replace("{body}", item.get("body", "")[:1800])
+        print(f"[{idx}/{len(fresh)}] {item.get('title', '')[:90]}")
+        data = extract_json(client, prompt)
+        if data is not None:
+            processed.append(item["link"])
+        if data and data.get("relevant") and data.get("company"):
+            if excluded_nft_or_meme(data):
+                print(f"  - excluded NFT/meme-first project: {data.get('company')}")
+                if len(processed) >= SAVE_BATCH_SIZE:
+                    flush()
+                time.sleep(DELAY)
+                continue
+            event_type = data.get("event_type") or "Funding round"
+            event_date = data.get("event_date") or date
+            key = event_key(data.get("company"), event_date, event_type, data.get("stage", ""), data.get("amount_usd", ""))
+            seen_keys.add(key)
+            hq = ", ".join(filter(None, [data.get("hq_city"), data.get("hq_country")]))
+            website = str(data.get("website") or "").rstrip("/")
+            pending.append([
+                    event_date, data.get("company", ""), data.get("stage", "Unknown"), data.get("amount_usd") or "",
+                    data.get("sector", ""), hq, data.get("one_liner", ""),
+                    "B2B" if data.get("is_b2b") else "B2C/Consumer/Unknown", "", "", data.get("hiring_signal", "Unknown"),
+                    website, f"{website}/careers" if website else "", ", ".join(data.get("founders", []) or []),
+                    data.get("lead_investor") or "", item.get("link", ""), "New", data.get("evidence_note", ""), key,
+                    data.get("broad_offerings", ""), data.get("niche_presence", ""), data.get("product_type", ""),
+                    data.get("target_customers", ""), ", ".join(data.get("other_investors", []) or []), data.get("valuation_usd") or "",
+                    event_type, item.get("publisher", ""), data.get("confidence", "Low"),
+                    datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), item.get("published", ""),
+            ])
+            print(f"  + {data.get('company')} | {event_type} | {data.get('sector')}")
+        if len(pending) >= SAVE_BATCH_SIZE or len(processed) >= SAVE_BATCH_SIZE:
+            flush()
+        time.sleep(DELAY)
+    flush()
+    print(f"Backfill batch finished. Rows appended: {appended}; events enriched: {updated}. Re-run workflow to process remaining indexed results.")
 
 
 if __name__ == "__main__":
