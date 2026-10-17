@@ -1,11 +1,11 @@
-# Startup Intelligence Tracker (v2)
+# Startup Intelligence Tracker (v6)
 
 Two Google Sheets data streams powered by Python, Groq, GitHub Actions, and a Google Apps Script webhook:
 
 1. **Funding Intelligence** — global AI, deep-tech, crypto/Web3 and fintech funding rounds, explicit company formation/incorporation signals, and reported hiring/expansion signals.
 2. **Crypto Launch Radar** — a selective list of substantive crypto/Web3 launches. NFT/PFP/collectibles-first and meme/memecoin projects are excluded; every tracked launch must have at least one publicly named founder with evidence of a previous shipped Web3 product/protocol or Web3 company-building track record.
 
-The historical backfill defaults to **1 August 2026 through the current UTC date**. Live collection runs hourly and historical catch-up runs daily. GitHub Actions timing is best-effort, not guaranteed real-time.
+The historical backfill defaults to **1 August 2026 through the current UTC date**. Live collection runs hourly; historical backfills run every 10 minutes until each stream has caught up through the current date, then each backfill workflow disables its own schedule. GitHub Actions timing is best-effort, not guaranteed real-time.
 
 ## Data coverage and limitations
 
@@ -21,9 +21,9 @@ The historical backfill defaults to **1 August 2026 through the current UTC date
 
 ## Crypto Launch Radar presentation
 
-The Apps Script formats the Crypto Launch Radar to match the clean Funding Intelligence table style: navy/white headers, filters, frozen header and first two columns, alternating row backgrounds, readable widths, wrapped context fields, clickable-looking evidence/social URL columns, and light confidence colors. The machine dedupe-key column is hidden; source and founder evidence remain visible. The final social/docs-links column extracts actual X, GitHub, Discord, Telegram, LinkedIn, YouTube, Farcaster and docs URLs linked from the project website. It does not construct guessed handles and stays blank if the site cannot be fetched or has no supported links.
+The Apps Script formats the Crypto Launch Radar to match the clean Funding Intelligence table style: charcoal/white headers, filters, frozen header and first two columns, alternating row backgrounds, readable widths, wrapped context fields, blue underlined evidence/social URL columns, and light confidence colors. The machine dedupe-key column is hidden; source and founder evidence remain visible. The final social/docs-links column extracts actual X, GitHub, Discord, Telegram, LinkedIn, YouTube, Farcaster and docs URLs linked from the project website. It does not construct guessed handles and stays blank if the site cannot be fetched or has no supported links.
 
-After updating Apps Script, open the webhook once with `?token=YOUR_TOKEN&stream=crypto` to style the existing tab; subsequent writes keep new rows formatted. The existing Python column positions are preserved; the social/docs link field is appended as the final column.
+After updating Apps Script, open the webhook once with `?token=YOUR_TOKEN&stream=crypto&action=format` to apply formatting to the existing tab; subsequent writes keep new rows formatted. The existing Python column positions are preserved; the social/docs link field is appended as the final column.
 
 ## 1. Configure the Google Sheet
 
@@ -69,11 +69,13 @@ The hourly workflows are deliberately capped at four funding candidates and two 
 
 After the webhook is deployed and GitHub secrets are set:
 
-1. Run **backfill-funding-intelligence** and **backfill-crypto-launch-radar** manually once from the Actions tab to begin the historical collection immediately. Manual runs process up to 60 candidates per run.
-2. Both workflows also run automatically every day. Scheduled runs process up to 20 funding candidates and 10 crypto-launch candidates per day, using the same processed-source registry to skip sources already inspected. Repeated runs continue through indexed historical results; the hourly workflows independently capture newly surfaced current signals.
-3. Check each run in GitHub Actions. If a job fails due to rate limits or a timeout, use **Run workflow** to retry manually.
+1. Push both workflow files to the repository's **default branch** (usually `main`). Click **Run workflow** once for each to start immediately; after that, the schedule continues automatically.
+2. Funding backfill runs every 10 minutes at minutes 2, 12, 22, 32, 42 and 52 UTC. Crypto backfill runs at minutes 7, 17, 27, 37, 47 and 57 UTC. This staggering avoids starting both model-heavy runs together. Scheduled runs process one candidate per stream to limit usage under the free-tier quota; manual runs process up to 10 candidates.
+3. Each run works on one seven-day window from 1 August 2026 onward. The cursor advances only when all candidates in that window are processed and webhook writes are confirmed. If there are more than the per-run cap, model errors, or webhook failures, that window is retried on the next run.
+4. Cursor progress is stored in `.backfill-state/funding.json` and `.backfill-state/crypto.json`. The workflow commits these state files automatically. Do not delete them while the backfill is running.
+5. When a stream reaches the end-exclusive date for today, its workflow commits the final cursor and disables its own schedule. The separate hourly live-collection workflows remain enabled. If you need to restart a historical run later, re-enable that workflow under Actions and run it manually.
 
-Date range is controlled by `BACKFILL_DATE_FROM` and `BACKFILL_DATE_TO`. Defaults are `2026-08-01` and tomorrow's UTC date (exclusive), so today is included. The scheduled daily backfills keep this end date moving forward automatically. Search feeds have finite and changing coverage, so this cannot guarantee every company or launch since August is found. For a fresh replay, clear the hidden processed-source registry only after backing it up; otherwise the webhook correctly skips previously processed sources.
+The backfill uses `2026-08-01` as the start date and tomorrow's UTC date as the exclusive end, so the current UTC date is included. The source feeds have finite and changing coverage; completion means the configured queries and available sources have been processed, not that every company or launch worldwide has been found. GitHub scheduled runs are best-effort and may be delayed. If a workflow fails due to rate limits, API errors or a timeout, inspect the run logs; its cursor should not advance for an unresolved window.
 
 ## 5. Columns
 
@@ -98,4 +100,4 @@ python backfill.py
 python backfill_crypto.py
 ```
 
-The two backfill scripts can be run manually and are also scheduled daily by `.github/workflows/backfill.yml` and `.github/workflows/backfill-crypto.yml`. Hourly collection is managed by `.github/workflows/fetch.yml` and `.github/workflows/fetch-crypto.yml`.
+The two backfill scripts can be run manually and use `.github/workflows/backfill.yml` and `.github/workflows/backfill-crypto.yml` for the 10-minute catch-up schedule. Each backfill workflow disables itself after it reaches the current date. Hourly collection remains managed by `.github/workflows/fetch.yml` and `.github/workflows/fetch-crypto.yml`.

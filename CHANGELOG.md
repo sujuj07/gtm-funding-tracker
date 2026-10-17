@@ -8,6 +8,14 @@
 
 # Changelog
 
+## v6 — 10-minute resumable backfill and table styling
+
+- Changed historical catch-up from daily whole-range rescans to one resumable seven-day window per run, scheduled every 10 minutes with funding/crypto runs staggered. Scheduled runs process one candidate at a time to conserve model quota; manual runs process up to 10.
+- Persisted each stream cursor in `.backfill-state/*.json` and only advance after the window is processed and webhook writes are confirmed.
+- Retried windows with candidate overflow, model extraction errors, or unconfirmed webhook writes.
+- Added self-disable at catch-up completion; hourly live collectors remain enabled.
+- Aligned Crypto Launch Radar formatting with the Funding Intelligence charcoal header, filters, frozen key columns, readable widths, row fills, confidence highlights and URL styling.
+
 ## v2 — October 2026
 
 - Split the system into a global funding/company-intelligence stream and a crypto launch radar stream.

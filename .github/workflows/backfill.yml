@@ -1,27 +1,34 @@
 name: backfill-funding-intelligence
 
 on:
-  # Daily catch-up; each run uses the current date as the exclusive end date.
+  # Resume one seven-day window every 10 minutes until caught up through today.
   schedule:
-    - cron: "5 0 * * *"
+    - cron: "2-59/10 * * * *"
   workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 25
     concurrency:
       group: startup-intelligence-funding-backfill
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
       - name: Install dependencies
         run: pip install -r requirements.txt
-      - name: Backfill from August 1, 2026 to today
+      - name: Process the next funding-history window
+        id: backfill
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GROQ_MODEL: openai/gpt-oss-20b
@@ -29,5 +36,26 @@ jobs:
           WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
           DEFILLAMA_API_KEY: ${{ secrets.DEFILLAMA_API_KEY }}
           BACKFILL_DATE_FROM: "2026-08-01"
-          BACKFILL_MAX_ITEMS_PER_RUN: ${{ github.event_name == 'schedule' && '20' || '60' }}
+          BACKFILL_WINDOW_DAYS: "7"
+          BACKFILL_MAX_ITEMS_PER_RUN: ${{ github.event_name == 'schedule' && '1' || '10' }}
         run: python backfill.py
+      - name: Persist cursor on the default branch
+        if: success()
+        shell: bash
+        run: |
+          mkdir -p .backfill-state
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A .backfill-state
+          if git diff --cached --quiet; then
+            echo "No cursor change to commit."
+            exit 0
+          fi
+          git commit -m "chore(backfill): advance funding history cursor"
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          git push origin "HEAD:$GITHUB_REF_NAME"
+      - name: Disable this schedule once funding history reaches today
+        if: steps.backfill.outputs.caught_up == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/backfill.yml/disable"

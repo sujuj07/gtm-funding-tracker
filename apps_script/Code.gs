@@ -70,76 +70,88 @@ function ensureHeaders(sheet, stream) {
  * Gives Crypto Launch Radar the same clean, filterable treatment as Funding Intelligence.
  * Called on GET/POST so the existing blank tab gets styled and newly inserted rows stay readable.
  */
-function formatTrackerSheet(sheet, stream) {
-  if (stream !== 'crypto') return; // avoid changing the user's established funding layout
+function formatTrackerSheet(sheet, stream, rowsJustInserted) {
+  if (stream !== 'crypto') return; // preserve the user's established funding-sheet format
 
   const width = STREAMS.crypto.maxCol;
   const lastRow = Math.max(sheet.getLastRow(), 1);
-  const navy = '#1F3557';
   const header = sheet.getRange(1, 1, 1, width);
+
+  // Match Funding Intelligence: dark header, white bold text, filter controls, frozen headings.
   header
-    .setBackground(navy)
+    .setBackground('#202124')
     .setFontColor('#FFFFFF')
     .setFontFamily('Arial')
     .setFontSize(10)
     .setFontWeight('bold')
     .setWrap(true)
     .setVerticalAlignment('middle')
-    .setHorizontalAlignment('left');
-  sheet.setRowHeight(1, 38);
+    .setHorizontalAlignment('center');
+  sheet.setRowHeight(1, 36);
   sheet.setFrozenRows(1);
   sheet.setFrozenColumns(2);
 
-  // Intentional widths: enough room for useful context, with URL/technical columns clearly separated.
+  // Compact the key discovery columns; reserve wide cells for actual research context.
   const widths = {
-    1: 135, 2: 205, 3: 145, 4: 110, 5: 135, 6: 115, 7: 190, 8: 190,
-    9: 330, 10: 270, 11: 205, 12: 235, 13: 250, 14: 250, 15: 270, 16: 125,
-    17: 155, 18: 220, 19: 145, 20: 260, 21: 155, 22: 180, 23: 280, 24: 245,
-    25: 245, 26: 175, 27: 300, 28: 310
+    1: 145, 2: 210, 3: 155, 4: 115, 5: 145, 6: 130, 7: 205, 8: 205,
+    9: 320, 10: 265, 11: 205, 12: 245, 13: 300, 14: 260, 15: 300, 16: 135,
+    17: 165, 18: 220, 19: 165, 20: 300, 21: 155, 22: 175, 23: 300, 24: 250,
+    25: 250, 26: 185, 27: 310, 28: 310
   };
   Object.keys(widths).forEach(function (col) { sheet.setColumnWidth(Number(col), widths[col]); });
 
   if (lastRow > 1) {
-    const body = sheet.getRange(2, 1, lastRow - 1, width);
+    // Full format on an explicit GET health/format call; on POST, style only newly inserted rows.
+    const rowCount = (rowsJustInserted === undefined) ? (lastRow - 1) : Math.min(Math.max(0, rowsJustInserted), lastRow - 1);
+    if (rowCount > 0) {
+    const body = sheet.getRange(2, 1, rowCount, width);
     body.setFontFamily('Arial').setFontSize(10).setFontColor('#202124').setVerticalAlignment('middle');
     body.setWrap(false);
 
-    // Soft alternating row backgrounds, with confidence colors applied in the same batch.
+    // Alternating soft fills; confidence is visibly highlighted without scoring projects.
     const backgrounds = [];
-    const confidenceValues = sheet.getRange(2, 16, lastRow - 1, 1).getValues().flat();
-    for (let r = 2; r <= lastRow; r++) {
-      const fill = (r % 2 === 0) ? '#FFFFFF' : '#F3F6FA';
+    const confidenceValues = sheet.getRange(2, 16, rowCount, 1).getValues().flat();
+    for (let i = 0; i < rowCount; i++) {
+      const fill = (i % 2 === 0) ? '#FFFFFF' : '#F3F4F6';
       const rowBackgrounds = new Array(width).fill(fill);
-      const confidence = String(confidenceValues[r - 2] || '').toLowerCase();
+      const confidence = String(confidenceValues[i] || '').toLowerCase();
       if (confidence.indexOf('high') >= 0) rowBackgrounds[15] = '#D9EAD3';
       else if (confidence.indexOf('medium') >= 0) rowBackgrounds[15] = '#FFF2CC';
       else if (confidence.indexOf('low') >= 0) rowBackgrounds[15] = '#F4CCCC';
       backgrounds.push(rowBackgrounds);
     }
     body.setBackgrounds(backgrounds);
-    sheet.setRowHeights(2, lastRow - 1, 42);
+    sheet.setRowHeights(2, rowCount, 42);
 
-    // Descriptive fields get wrapping so context and team details remain useful in-cell.
-    [9, 10, 11, 12, 15, 20, 23, 27, 28].forEach(function (col) {
-      sheet.getRange(2, col, lastRow - 1, 1).setWrap(true);
+    // Keep the high-value descriptive fields readable; leave dates and IDs compact.
+    [9, 10, 11, 12, 13, 15, 20, 23, 24, 25, 27, 28].forEach(function (col) {
+      sheet.getRange(2, col, rowCount, 1).setWrap(true);
+    });
+    [1, 3, 4, 5, 15, 16, 17, 21, 22, 26].forEach(function (col) {
+      sheet.getRange(2, col, rowCount, 1).setHorizontalAlignment('center');
     });
 
-    // Make verified-source and social links easy to identify. URLs stay as plain cell values.
+    // Blue underlined treatment for source/profile/site URL columns.
     [7, 8, 13, 14, 20, 24, 25, 28].forEach(function (col) {
-      sheet.getRange(2, col, lastRow - 1, 1)
-        .setFontColor('#1155CC')
-        .setFontLine('underline');
+      sheet.getRange(2, col, rowCount, 1).setFontColor('#1155CC').setFontLine('underline');
     });
+    }
   }
 
-  // Hide only the machine-use dedupe key; retain research and evidence columns for auditability.
+  // Hide the machine-only key. Founder track-record and source evidence remain visible/auditable.
   sheet.hideColumns(18);
 
-  // Add filter controls once. Preserve the user's filter criteria if a filter already exists.
-  if (!sheet.getFilter()) {
-    sheet.getRange(1, 1, Math.max(2, lastRow), width).createFilter();
+  // Ensure the filter covers all populated rows; keep it if it already covers the table.
+  const filterLastRow = Math.max(2, lastRow);
+  const currentFilter = sheet.getFilter();
+  if (!currentFilter) {
+    sheet.getRange(1, 1, filterLastRow, width).createFilter();
+  } else if (currentFilter.getRange().getLastRow() < filterLastRow) {
+    currentFilter.remove();
+    sheet.getRange(1, 1, filterLastRow, width).createFilter();
   }
 }
+
 
 function getRegistrySheet() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
@@ -324,7 +336,7 @@ function doPost(e) {
     }
 
     // Apply the crypto presentation after inserts/updates so newly added rows match the table style.
-    formatTrackerSheet(sheet, stream);
+    formatTrackerSheet(sheet, stream, toAdd.length);
 
     // Mark all inspected source URLs, including irrelevant stories, so backfills progress across runs.
     const processed = (Array.isArray(body.processedSources) ? body.processedSources : []).concat(
@@ -358,7 +370,7 @@ function doGet(e) {
       names.forEach(function (name) { const norm = normalizeCompany(name); if (norm) set[norm] = true; });
       return jsonOut({ ok: true, stream: stream, companies: Object.keys(set) });
     }
-    return jsonOut({ ok: true, message: 'webhook live', stream: stream, sheet: sheet.getName() });
+    return jsonOut({ ok: true, message: action === 'format' ? 'sheet formatting applied' : 'webhook live', stream: stream, sheet: sheet.getName() });
   } catch (err) {
     return jsonOut({ ok: false, error: String(err) });
   }
