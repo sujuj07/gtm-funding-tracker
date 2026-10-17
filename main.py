@@ -4,7 +4,7 @@ import time
 from datetime import datetime, timezone
 
 from tracker_common import (
-    MODEL, defillama_raises, event_key, extract_json, fetch_google_news,
+    MODEL_CHAIN_LABEL, defillama_raises, event_key, extract_json, fetch_google_news,
     fetch_rss_feed, groq_client, norm_company, parse_event_date, post_rows, published_timestamp,
     webhook_get, excluded_nft_or_meme,
 )
@@ -99,7 +99,7 @@ def make_items():
 
 
 def main():
-    print(f"Funding intelligence run | model={MODEL} | UTC={datetime.now(timezone.utc).isoformat()}")
+    print(f"Funding intelligence run | model-route={MODEL_CHAIN_LABEL} | UTC={datetime.now(timezone.utc).isoformat()}")
     existing_sources = webhook_get(STREAM, "existing_sources")
     existing_keys = webhook_get(STREAM, "existing_keys")
     items = make_items()

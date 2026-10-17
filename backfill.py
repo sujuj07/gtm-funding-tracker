@@ -6,10 +6,11 @@ Apps Script so free-tier batches make forward progress rather than repeat work.
 """
 import os
 import time
+import math
 from datetime import datetime, timedelta, timezone
 
 from tracker_common import (
-    MODEL, defillama_raises, event_key, extract_json, fetch_google_news,
+    MODEL_CHAIN_LABEL, defillama_raises, event_key, extract_json, fetch_google_news,
     groq_client, post_rows, webhook_get, norm_company, parse_event_date, published_timestamp,
     excluded_nft_or_meme,
 )
@@ -92,18 +93,41 @@ def date_windows(start: str, end_exclusive: str, window_days: int):
 
 def collect_items(window_start: str, window_end: str):
     gathered = {}
+    successful_queries = 0
+    query_errors = []
     for query in QUERIES:
-        for item in fetch_google_news(query, after=window_start, before=window_end, limit=MAX_ITEMS_PER_QUERY):
-            if item.get("link"):
-                gathered.setdefault(item["link"], item)
-        time.sleep(0.25)
+        try:
+            results = fetch_google_news(
+                query, after=window_start, before=window_end,
+                limit=MAX_ITEMS_PER_QUERY, strict=True,
+            )
+            successful_queries += 1  # A valid HTTP response, even if it has zero entries.
+            for item in results:
+                if item.get("link"):
+                    gathered.setdefault(item["link"], item)
+        except Exception as exc:
+            query_errors.append((query, str(exc)))
+            print(f"  [warn] historical search failed for query={query!r}: {exc}")
+        time.sleep(0.60)
+
+    # Do not mistake an RSS outage/auth/network issue for a truly empty historical
+    # week. Require >=80% successful query responses before this window can advance.
+    required = max(1, math.ceil(len(QUERIES) * 0.80))
+    print(f"  historical query coverage: {successful_queries}/{len(QUERIES)} successful; required={required}")
+    if successful_queries < required:
+        raise RuntimeError(
+            f"Insufficient historical search coverage for {window_start} to {window_end}: "
+            f"{successful_queries}/{len(QUERIES)} queries succeeded; cursor will not advance."
+        )
+    if query_errors:
+        print(f"  [warn] {len(query_errors)} search query/queries failed; coverage threshold passed, results may be partial.")
     print(f"  fetched historical search window {window_start} to {window_end}")
     # DeFiLlama Raises is optional; only use rows that fall inside the active window.
     for item in defillama_raises():
         dt = parse_event_date(item)
         if dt != "Unknown" and window_start <= dt < window_end and item.get("link"):
             gathered.setdefault(item["link"], item)
-    return sorted(gathered.values(), key=published_timestamp, reverse=True)
+    return sorted(gathered.values(), key=published_timestamp, reverse=True), bool(query_errors)
 
 
 def main():
@@ -111,8 +135,8 @@ def main():
     if window is None:
         return
     window_start, window_end = window
-    print(f"Historical funding backfill | {window_start} <= dates < {window_end} | current target end={DATE_TO} | model={MODEL}")
-    items = collect_items(window_start, window_end)
+    print(f"Historical funding backfill | {window_start} <= dates < {window_end} | current target end={DATE_TO} | model-route={MODEL_CHAIN_LABEL}")
+    items, search_incomplete = collect_items(window_start, window_end)
     existing_sources = webhook_get(STREAM, "existing_sources")
     existing_keys = webhook_get(STREAM, "existing_keys")
     fresh_all = [item for item in items if item.get("link") and item["link"] not in existing_sources]
@@ -185,6 +209,8 @@ def main():
 
     if failed_items:
         leave_window_pending(window_start, window_end, f"{len(failed_items)} source(s) had model errors")
+    elif search_incomplete:
+        leave_window_pending(window_start, window_end, "one or more search queries failed; retrying the same date window for complete coverage")
     elif more_candidates:
         leave_window_pending(window_start, window_end, f"{len(fresh_all) - len(fresh)} fresh candidate(s) remain for this week")
     elif flush_unconfirmed:
@@ -192,7 +218,7 @@ def main():
     else:
         caught_up = advance_window(STREAM, window_start, window_end, DATE_TO)
         if caught_up:
-            print("[backfill] HISTORICAL BACKFILL COMPLETE through today's target date; workflow can disable its 10-minute schedule.")
+            print("[backfill] HISTORICAL BACKFILL COMPLETE through today's target date; workflow can disable its hourly schedule.")
 
 
 if __name__ == "__main__":

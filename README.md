@@ -5,7 +5,7 @@ Two Google Sheets data streams powered by Python, Groq, GitHub Actions, and a Go
 1. **Funding Intelligence** — global AI, deep-tech, crypto/Web3 and fintech funding rounds, explicit company formation/incorporation signals, and reported hiring/expansion signals.
 2. **Crypto Launch Radar** — a selective list of substantive crypto/Web3 launches. NFT/PFP/collectibles-first and meme/memecoin projects are excluded; every tracked launch must have at least one publicly named founder with evidence of a previous shipped Web3 product/protocol or Web3 company-building track record.
 
-The historical backfill defaults to **1 August 2026 through the current UTC date**. Live collection runs hourly; historical backfills run every 10 minutes until each stream has caught up through the current date, then each backfill workflow disables its own schedule. GitHub Actions timing is best-effort, not guaranteed real-time.
+The historical backfill defaults to **1 August 2026 through the current UTC date**. Live collection runs hourly; historical backfills run hourly until each stream has caught up through the current date, then each backfill workflow disables its own schedule. GitHub Actions timing is best-effort, not guaranteed real-time.
 
 ## Data coverage and limitations
 
@@ -59,18 +59,21 @@ Optional:
 - `X_BEARER_TOKEN` — X API v2 bearer token; enables direct recent-X launch search.
 - `DEFILLAMA_API_KEY` — DeFiLlama API-plan key; enables its structured Raises endpoint.
 
-Optional repository variable:
+Optional environment configuration:
 
-- `GROQ_MODEL` — defaults to `openai/gpt-oss-120b` for scheduled research. Historical backfill workflows use `openai/gpt-oss-20b` to conserve the larger model's token budget.
+- `GROQ_MODEL` — primary model. Funding workflows start with `openai/gpt-oss-20b`; crypto workflows start with `qwen/qwen3.8-27b` so the two streams use separate quota pools by default.
+- `GROQ_MODEL_FALLBACKS` — comma-separated fallback order. Defaults to `qwen/qwen3.8-27b,openai/gpt-oss-120b`.
+- The shared router tries the primary model first. If Groq returns a 429/rate-limit response, the router marks that model unavailable for the rest of the current run and tries the next configured model without waiting on the depleted quota. It also falls through to the next model if the configured model is unavailable or incompatible. Transient 5xx/timeouts get short retries first. Logs show which model actually succeeded.
+- Model quotas are separate by model, as shown in the Groq console. Fallback spreads work across available quota pools; it cannot guarantee a request succeeds if all configured models have reached their limits. The cooldown memory is per Python process, so a newly scheduled GitHub Actions run will check the primary again before switching if its quota is still exhausted.
 
-The hourly workflows are deliberately capped at four funding candidates and two crypto-launch candidates per hourly run to help stay within the 200k tokens/day and 1k requests/day model limits shown in the supplied Groq console screenshot. Crypto candidates that pass first-stage launch triage undergo a second model review plus multiple Google News evidence searches, so accepted candidates consume more tokens/requests than rejected ones. If usage is comfortably below quota, increase `MAX_ITEMS_PER_RUN` / `CRYPTO_MAX_ITEMS_PER_RUN`; increasing them increases coverage and token use. The new strict gate applies to new rows; it does not automatically delete or retroactively vet crypto entries already present in the sheet.
+The hourly workflows are deliberately capped at four funding candidates and two crypto-launch candidates per hourly run. Funding starts with GPT-OSS 20B; crypto starts with Qwen 3.8 27B. Both automatically fall back to the other smaller model, then GPT-OSS 120B, when a model is rate-limited or unavailable. This uses separate model quota pools instead of relying on GPT-OSS 120B for every task. The Groq console’s exact limits are model/organization-specific; monitor usage in GroqCloud. Crypto candidates that pass first-stage launch triage undergo a second model review plus multiple Google News evidence searches, so accepted candidates consume more tokens/requests than rejected ones. If usage is comfortably below quota, increase `MAX_ITEMS_PER_RUN` / `CRYPTO_MAX_ITEMS_PER_RUN`; increasing them increases coverage and token use. The new strict gate applies to new rows; it does not automatically delete or retroactively vet crypto entries already present in the sheet.
 
 ## 4. Automated historical backfill and catch-up
 
 After the webhook is deployed and GitHub secrets are set:
 
 1. Push both workflow files to the repository's **default branch** (usually `main`). Click **Run workflow** once for each to start immediately; after that, the schedule continues automatically.
-2. Funding backfill runs every 10 minutes at minutes 2, 12, 22, 32, 42 and 52 UTC. Crypto backfill runs at minutes 7, 17, 27, 37, 47 and 57 UTC. This staggering avoids starting both model-heavy runs together. Scheduled runs process one candidate per stream to limit usage under the free-tier quota; manual runs process up to 10 candidates.
+2. Funding backfill runs hourly at minute 10 UTC; crypto backfill runs hourly at minute 40 UTC. This staggering avoids starting both model-heavy runs together. Scheduled runs process up to 4 funding candidates and 2 crypto candidates per run; manual runs process up to 12 funding candidates and 6 crypto candidates.
 3. Each run works on one seven-day window from 1 August 2026 onward. The cursor advances only when all candidates in that window are processed and webhook writes are confirmed. If there are more than the per-run cap, model errors, or webhook failures, that window is retried on the next run.
 4. Cursor progress is stored in `.backfill-state/funding.json` and `.backfill-state/crypto.json`. The workflow commits these state files automatically. Do not delete them while the backfill is running.
 5. When a stream reaches the end-exclusive date for today, its workflow commits the final cursor and disables its own schedule. The separate hourly live-collection workflows remain enabled. If you need to restart a historical run later, re-enable that workflow under Actions and run it manually.
@@ -100,4 +103,13 @@ python backfill.py
 python backfill_crypto.py
 ```
 
-The two backfill scripts can be run manually and use `.github/workflows/backfill.yml` and `.github/workflows/backfill-crypto.yml` for the 10-minute catch-up schedule. Each backfill workflow disables itself after it reaches the current date. Hourly collection remains managed by `.github/workflows/fetch.yml` and `.github/workflows/fetch-crypto.yml`.
+The two backfill scripts can be run manually and use `.github/workflows/backfill.yml` and `.github/workflows/backfill-crypto.yml` for the hourly catch-up schedule. Each backfill workflow disables itself after it reaches the current date. Hourly collection remains managed by `.github/workflows/fetch.yml` and `.github/workflows/fetch-crypto.yml`.
+
+## Historical backfill behavior (v8)
+
+- Funding history is scheduled hourly at minute 10 UTC; crypto-launch history is scheduled hourly at minute 40 UTC. These are UTC times, not India local time.
+- Each scheduled run processes a bounded batch (4 funding candidates or 2 crypto candidates). Manual dispatch processes a larger batch.
+- A date window advances only when candidate processing and webhook writes have been confirmed, no model failures remain, and search coverage is sufficient. RSS/HTTP and webhook registry errors fail closed rather than being interpreted as empty data.
+- If an earlier version advanced the cursor too far, manually run the relevant workflow and set `reset_cursor` to `true`. It restarts scanning at 2026-08-01. Existing processed source URLs remain stored in the hidden Apps Script registry, preventing duplicate processing.
+- Once the backfill reaches today's target date, the workflow disables its own schedule; the separate hourly live-monitoring workflow continues. GitHub scheduled runs are best-effort and may be delayed.
+

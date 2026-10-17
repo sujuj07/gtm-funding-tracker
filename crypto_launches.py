@@ -4,7 +4,7 @@ import time
 from datetime import datetime, timezone
 
 from tracker_common import (
-    MODEL, account_freshness, event_key, extract_json, fetch_google_news, fetch_rss_feed,
+    MODEL_CHAIN_LABEL, account_freshness, event_key, extract_json, fetch_google_news, fetch_rss_feed,
     fetch_official_social_links, groq_client, parse_event_date, post_rows, verify_crypto_launch_quality,
     webhook_get, x_recent_search,
 )
@@ -79,7 +79,7 @@ def make_items():
 
 
 def main():
-    print(f"Crypto launch radar | strict-founder-gate=on | model={MODEL} | UTC={datetime.now(timezone.utc).isoformat()}")
+    print(f"Crypto launch radar | strict-founder-gate=on | model-route={MODEL_CHAIN_LABEL} | UTC={datetime.now(timezone.utc).isoformat()}")
     existing_sources = webhook_get(STREAM, "existing_sources")
     items = make_items()
     fresh = [item for item in items if item.get("link") and item["link"] not in existing_sources]
@@ -129,6 +129,11 @@ def main():
             print("  - rejected at launch/category triage")
         else:
             passed, vet, evidence_urls = verify_crypto_launch_quality(client, item, data, reported_date)
+            if vet.get("quality_gate_reason") == "No successful verification response.":
+                # Do not permanently dedupe a legitimate candidate just because all models
+                # were rate-limited or unavailable. Leave it eligible for the next run.
+                print("  [warn] founder verification could not reach a model; source left unprocessed for retry")
+                continue
             processed.append(item["link"])
             if not passed:
                 print(f"  - rejected by strict founder/track-record gate: {vet.get('quality_gate_reason', 'not enough verifiable evidence')}")

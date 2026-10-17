@@ -15,7 +15,17 @@ import feedparser
 import requests
 from groq import Groq
 
-MODEL = (os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip() or "openai/gpt-oss-120b")
+# Quota-aware model routing. Use the smaller GPT-OSS model by default, then
+# fall back to independent model quota pools when a model is rate-limited or unavailable.
+MODEL = (os.getenv("GROQ_MODEL", "openai/gpt-oss-20b").strip() or "openai/gpt-oss-20b")
+_DEFAULT_FALLBACKS = "qwen/qwen3.8-27b,openai/gpt-oss-120b"
+MODEL_FALLBACKS = [
+    value.strip() for value in os.getenv("GROQ_MODEL_FALLBACKS", _DEFAULT_FALLBACKS).split(",")
+    if value.strip()
+]
+MODEL_CHAIN = tuple(dict.fromkeys([MODEL, *MODEL_FALLBACKS]))
+MODEL_CHAIN_LABEL = " -> ".join(MODEL_CHAIN)
+_MODEL_BLOCKED_UNTIL: dict[str, float] = {}
 GROQ_KEY = os.environ["GROQ_API_KEY"]
 WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 WEBHOOK_TOKEN = os.environ["WEBHOOK_TOKEN"]
@@ -162,10 +172,25 @@ def google_news_rss_url(query: str, after: str | None = None, before: str | None
     return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
 
-def fetch_rss_feed(url: str, limit: int = 12, label: str = "") -> list[dict]:
+def fetch_rss_feed(
+    url: str, limit: int = 12, label: str = "", *, strict: bool = False
+) -> list[dict]:
+    """Fetch and parse an RSS feed.
+
+    In normal live monitoring, return [] on a feed error so one source doesn't stop
+    the whole job. Historical backfills pass strict=True so transport/HTTP failures
+    are not mistaken for an empty historical date range.
+    """
     results: list[dict] = []
     try:
-        feed = feedparser.parse(url)
+        response = requests.get(
+            url, timeout=(5, 20), allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; StartupIntelligenceTracker/1.0)"},
+        )
+        response.raise_for_status()
+        feed = feedparser.parse(response.content)
+        if getattr(feed, "bozo", False) and not getattr(feed, "entries", []):
+            raise RuntimeError(f"RSS parse failed: {getattr(feed, 'bozo_exception', 'invalid feed')}")
         for entry in feed.entries[:limit]:
             link = entry.get("link", "")
             if not link:
@@ -180,13 +205,18 @@ def fetch_rss_feed(url: str, limit: int = 12, label: str = "") -> list[dict]:
                 "source_type": "rss",
             })
     except Exception as exc:
+        if strict:
+            raise RuntimeError(f"RSS fetch failed for {label or url}: {type(exc).__name__}: {exc}") from exc
         print(f"[warn] RSS fetch failed for {url}: {exc}")
     return results
 
 
-def fetch_google_news(query: str, after: str | None = None, before: str | None = None, limit: int = 12) -> list[dict]:
+def fetch_google_news(
+    query: str, after: str | None = None, before: str | None = None,
+    limit: int = 12, *, strict: bool = False,
+) -> list[dict]:
     url = google_news_rss_url(query, after, before)
-    return fetch_rss_feed(url, limit=limit, label="Google News: " + query)
+    return fetch_rss_feed(url, limit=limit, label="Google News: " + query, strict=strict)
 
 def _as_name_list(value: Any) -> list[str]:
     if isinstance(value, list):
@@ -314,51 +344,171 @@ def groq_client() -> Groq:
     return Groq(api_key=GROQ_KEY)
 
 
-def extract_json(client: Groq, prompt: str, retries: int = 2) -> dict | None:
-    for attempt in range(retries + 1):
+def _duration_seconds(value: str) -> float | None:
+    """Parse common Retry-After/reset values such as 12, 1m20s, or 0.8s."""
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    matches = re.findall(r"([\d.]+)\s*(h|m|s)", raw)
+    if not matches:
+        return None
+    scales = {"h": 3600, "m": 60, "s": 1}
+    return sum(float(number) * scales[unit] for number, unit in matches)
+
+
+def _exception_status(exc: Exception) -> int | None:
+    status = getattr(exc, "status_code", None)
+    if status is not None:
         try:
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                response_format={"type": "json_object"},
-                temperature=0.1,
-                max_completion_tokens=1000,
-                reasoning_effort="low",
-            )
-            content = response.choices[0].message.content or "{}"
-            return json.loads(content)
-        except Exception as exc:
-            message = str(exc)
-            if any(token in message.lower() for token in ("429", "rate limit", "ratelimit")):
-                match = re.search(r"try again in ([\d.]+)s", message, re.I)
-                wait = min(float(match.group(1)) + 1, 90) if match else min(20 * (attempt + 1), 90)
-                print(f"  [retry] rate limited; waiting {wait:.0f}s")
-                time.sleep(wait)
-                continue
-            if any(code in message for code in ("500", "502", "503", "504")):
-                time.sleep(10 * (attempt + 1))
-                continue
-            print(f"[warn] model extraction failed: {message[:250]}")
-            return None
+            return int(status)
+        except (TypeError, ValueError):
+            pass
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _block_model_for_exception(model: str, exc: Exception) -> float:
+    """Mark a model unavailable for the remainder of this Python process."""
+    now = time.monotonic()
+    headers = {}
+    response = getattr(exc, "response", None)
+    try:
+        headers = dict(getattr(response, "headers", {}) or {})
+    except Exception:
+        headers = {}
+    normalized = {str(key).lower(): str(value) for key, value in headers.items()}
+    wait = _duration_seconds(normalized.get("retry-after", ""))
+    reset = _duration_seconds(normalized.get("x-ratelimit-reset-requests", ""))
+    token_reset = _duration_seconds(normalized.get("x-ratelimit-reset-tokens", ""))
+    message = str(exc).lower()
+    if wait is None:
+        if "day" in message or "daily" in message or "requests per day" in message:
+            wait = 3600  # This process skips the depleted model; subsequent runs will retry it.
+        else:
+            wait = max(reset or 0, token_reset or 0, 600)
+    # Avoid accidentally blocking a model for a week if an unfamiliar reset format is returned.
+    wait = min(max(wait, 30), 24 * 3600)
+    _MODEL_BLOCKED_UNTIL[model] = now + wait
+    return wait
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    return _exception_status(exc) == 429 or any(
+        marker in str(exc).lower() for marker in ("rate limit", "ratelimit", "too many requests")
+    )
+
+
+def _is_transient(exc: Exception) -> bool:
+    status = _exception_status(exc)
+    return status in {500, 502, 503, 504, 408} or any(
+        code in str(exc) for code in ("500", "502", "503", "504", "timeout", "temporarily unavailable")
+    )
+
+
+def _is_model_configuration_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in (
+        "model not found", "model_not_found", "decommissioned", "not available",
+        "unsupported model", "model is not supported", "unknown model",
+        "does not support response_format", "unsupported parameter", "invalid model",
+    ))
+
+
+def extract_json(client: Groq, prompt: str, retries: int = 2) -> dict | None:
+    """Request JSON with automatic model failover when quotas or model availability fail.
+
+    The selected primary model is tried first. On 429/quota errors the router skips it
+    for the rest of this process and tries the next model in GROQ_MODEL_FALLBACKS. This
+    prevents a run with several candidates from repeatedly hammering an exhausted model.
+    """
+    now = time.monotonic()
+    candidates = [model for model in MODEL_CHAIN if _MODEL_BLOCKED_UNTIL.get(model, 0) <= now]
+    if not candidates:
+        # Every configured pool was rate-limited earlier in this job. Let the next
+        # scheduled run retry rather than spend time or requests retrying known failures.
+        print("  [model-router] all configured models are cooling down; will retry on the next run")
+        return None
+
+    for model_index, model in enumerate(candidates):
+        for attempt in range(retries + 1):
+            try:
+                request = {
+                    "model": model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0.1,
+                    "max_completion_tokens": 1000,
+                }
+                # `reasoning_effort` is supported by GPT-OSS. Keep the Qwen request
+                # portable; if Groq adds model-specific parameters, the fallback remains usable.
+                if model.startswith("openai/gpt-oss-"):
+                    request["reasoning_effort"] = "low"
+                response = client.chat.completions.create(**request)
+                content = response.choices[0].message.content or "{}"
+                result = json.loads(content)
+                if not isinstance(result, dict):
+                    raise ValueError("Model returned JSON but it was not an object")
+                route = "primary" if model == MODEL else "fallback"
+                print(f"  [model-router] success model={model} route={route}")
+                return result
+            except Exception as exc:
+                message = str(exc)
+                if _is_rate_limited(exc):
+                    wait = _block_model_for_exception(model, exc)
+                    print(f"  [model-router] {model} rate-limited; switching model (cooldown ~{wait:.0f}s)")
+                    break  # Try the next model immediately; do not sleep on a depleted pool.
+                if _is_model_configuration_error(exc):
+                    _MODEL_BLOCKED_UNTIL[model] = time.monotonic() + 3600
+                    print(f"  [model-router] {model} unavailable/configuration-incompatible; trying the next model")
+                    break
+                if _is_transient(exc) and attempt < retries:
+                    wait = min(5 * (attempt + 1), 15)
+                    print(f"  [model-router] transient error for {model}; retry {attempt + 1}/{retries} in {wait}s")
+                    time.sleep(wait)
+                    continue
+                # A malformed/non-object JSON response gets one retry on the same model;
+                # other non-transient errors fall through to the next configured model.
+                if attempt < retries and isinstance(exc, (json.JSONDecodeError, ValueError)):
+                    print(f"  [model-router] invalid JSON from {model}; retrying")
+                    continue
+                print(f"  [model-router] {model} failed: {message[:220]}; trying next model if available")
+                break
+    print("[warn] all configured Groq models failed for this extraction")
     return None
 
 
 def webhook_get(stream: str, action: str) -> set[str]:
+    """Read dedupe state from Apps Script, failing closed on errors.
+
+    Returning an empty set on an auth/timeout error made a historical scan look like
+    a fresh empty period and could advance the cursor incorrectly. Backfills must
+    not advance unless the remote processed-source registry was read successfully.
+    """
+    response = requests.get(
+        WEBHOOK_URL,
+        params={"token": WEBHOOK_TOKEN, "stream": stream, "action": action},
+        timeout=30,
+    )
+    response.raise_for_status()
     try:
-        response = requests.get(
-            WEBHOOK_URL,
-            params={"token": WEBHOOK_TOKEN, "stream": stream, "action": action},
-            timeout=30,
-        )
-        response.raise_for_status()
         data = response.json()
-        if not data.get("ok"):
-            raise RuntimeError(str(data))
-        key = {"existing_sources": "sources", "existing_keys": "keys", "existing_companies": "companies"}[action]
-        return set(str(x) for x in data.get(key, []) if x)
-    except Exception as exc:
-        print(f"[warn] failed to fetch {action} for {stream}: {exc}")
-        return set()
+    except ValueError as exc:
+        raise RuntimeError(f"Webhook returned non-JSON for {action}/{stream}") from exc
+    if not data.get("ok"):
+        raise RuntimeError(f"Webhook GET {action}/{stream} failed: {data}")
+    key = {"existing_sources": "sources", "existing_keys": "keys", "existing_companies": "companies"}[action]
+    values = data.get(key)
+    if not isinstance(values, list):
+        raise RuntimeError(f"Webhook response missing '{key}' for {action}/{stream}")
+    return set(str(x) for x in values if x)
 
 
 def post_rows(stream: str, rows: list[list[Any]], processed_sources: list[str] | None = None) -> dict | None:

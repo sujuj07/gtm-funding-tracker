@@ -1,10 +1,11 @@
 """Historical crypto launch backfill with strict public-founder and prior-builder verification."""
 import os
 import time
+import math
 from datetime import datetime, timedelta, timezone
 
 from tracker_common import (
-    MODEL, event_key, extract_json, fetch_google_news, fetch_official_social_links, fetch_rss_feed, groq_client,
+    MODEL_CHAIN_LABEL, event_key, extract_json, fetch_google_news, fetch_official_social_links, fetch_rss_feed, groq_client,
     parse_event_date, post_rows, published_timestamp, verify_crypto_launch_quality, webhook_get,
 )
 from backfill_state import advance_window, choose_window, end_exclusive_today, leave_window_pending
@@ -66,11 +67,34 @@ def windows(start, end, days):
 
 def collect(window_start: str, window_end: str):
     items = {}
+    successful_queries = 0
+    query_errors = []
     for query in QUERIES:
-        for item in fetch_google_news(query, after=window_start, before=window_end, limit=ITEMS_PER_QUERY):
-            if item.get("link"):
-                items.setdefault(item["link"], item)
-        time.sleep(0.25)
+        try:
+            results = fetch_google_news(
+                query, after=window_start, before=window_end,
+                limit=ITEMS_PER_QUERY, strict=True,
+            )
+            successful_queries += 1
+            for item in results:
+                if item.get("link"):
+                    items.setdefault(item["link"], item)
+        except Exception as exc:
+            query_errors.append((query, str(exc)))
+            print(f"  [warn] crypto launch search failed for query={query!r}: {exc}")
+        time.sleep(0.60)
+
+    # Require valid HTTP results from >=80% of the search queries before considering
+    # a launch-history window reliable enough to advance its cursor.
+    required = max(1, math.ceil(len(QUERIES) * 0.80))
+    print(f"  launch query coverage: {successful_queries}/{len(QUERIES)} successful; required={required}")
+    if successful_queries < required:
+        raise RuntimeError(
+            f"Insufficient crypto-launch search coverage for {window_start} to {window_end}: "
+            f"{successful_queries}/{len(QUERIES)} queries succeeded; cursor will not advance."
+        )
+    if query_errors:
+        print(f"  [warn] {len(query_errors)} search query/queries failed; coverage threshold passed, results may be partial.")
     print(f"  collected launch coverage {window_start} to {window_end}")
     for url, name in [
         ("https://decrypt.co/feed", "Decrypt"),
@@ -81,7 +105,7 @@ def collect(window_start: str, window_end: str):
             published_date = parse_event_date(item)
             if item.get("link") and published_date != "Unknown" and window_start <= published_date < window_end:
                 items.setdefault(item["link"], item)
-    return sorted(items.values(), key=published_timestamp, reverse=True)
+    return sorted(items.values(), key=published_timestamp, reverse=True), bool(query_errors)
 
 
 def main():
@@ -89,8 +113,8 @@ def main():
     if window is None:
         return
     window_start, window_end = window
-    print(f"Crypto launch historical backfill | strict-founder-gate=on | {window_start} <= dates < {window_end} | current target end={DATE_TO} | model={MODEL}")
-    all_items = collect(window_start, window_end)
+    print(f"Crypto launch historical backfill | strict-founder-gate=on | {window_start} <= dates < {window_end} | current target end={DATE_TO} | model-route={MODEL_CHAIN_LABEL}")
+    all_items, search_incomplete = collect(window_start, window_end)
     existing_sources = webhook_get(STREAM, "existing_sources")
     fresh_all = [x for x in all_items if x.get("link") and x["link"] not in existing_sources]
     more_candidates = len(fresh_all) > MAX_ITEMS_PER_RUN
@@ -132,6 +156,10 @@ def main():
             print("  - rejected at launch/category triage")
         else:
             passed, vet, evidence_urls = verify_crypto_launch_quality(client, item, data, date)
+            if vet.get("quality_gate_reason") == "No successful verification response.":
+                failed_items.append(item["link"])
+                print("  [warn] founder verification could not reach a model; date window will be retried")
+                continue
             processed.append(item["link"])
             if not passed:
                 print(f"  - rejected by strict founder/track-record gate: {vet.get('quality_gate_reason', 'not enough verifiable evidence')}")
@@ -164,6 +192,8 @@ def main():
 
     if failed_items:
         leave_window_pending(window_start, window_end, f"{len(failed_items)} source(s) had model errors")
+    elif search_incomplete:
+        leave_window_pending(window_start, window_end, "one or more search queries failed; retrying the same date window for complete coverage")
     elif more_candidates:
         leave_window_pending(window_start, window_end, f"{len(fresh_all) - len(fresh)} fresh candidate(s) remain for this week")
     elif flush_unconfirmed:
@@ -171,7 +201,7 @@ def main():
     else:
         caught_up = advance_window(STREAM, window_start, window_end, DATE_TO)
         if caught_up:
-            print("[backfill] HISTORICAL BACKFILL COMPLETE through today's target date; workflow can disable its 10-minute schedule.")
+            print("[backfill] HISTORICAL BACKFILL COMPLETE through today's target date; workflow can disable its hourly schedule.")
 
 
 if __name__ == "__main__":

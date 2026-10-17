@@ -1,3 +1,14 @@
+# Changelog
+
+## v8 — backfill reliability and hourly cadence
+- Scheduled historical funding backfill hourly at minute 10, processing up to 4 candidates per run.
+- Scheduled crypto launch backfill hourly at minute 40, processing up to 2 candidates per run.
+- Historical RSS requests now check HTTP status and malformed-feed failures.
+- Backfills require at least 80% of Google News queries to return valid responses; if partial query failures occur, candidates can be saved but the date window is kept pending for retry.
+- Apps Script registry lookup errors now fail closed rather than returning an empty dedupe set.
+- Added `workflow_dispatch` input `reset_cursor` to restart the corresponding backfill at 2026-08-01 while preserving source-level deduplication in the hidden Apps Script registry.
+- Existing live-monitoring workflows remain on their prior schedules.
+
 ## v5 — Automated historical catch-up
 
 - Added daily schedules for funding and crypto historical backfills.
@@ -6,7 +17,6 @@
 - Backfill end date remains dynamic, so the current UTC date is included automatically.
 - Documented that full global coverage is limited by indexed source availability.
 
-# Changelog
 
 ## v6 — 10-minute resumable backfill and table styling
 
@@ -43,3 +53,11 @@
 - Hide the internal deduplication key while retaining source URLs and founder/track-record evidence.
 
 - Add a final `Other Official Links` field populated only from links found on the supplied project homepage (no guessed handles).
+
+
+## v7 — Quota-aware model routing
+
+- Default all GitHub workflows to `openai/gpt-oss-20b` for routine extraction.
+- Added automatic fallback to `qwen/qwen3.8-27b`, then `openai/gpt-oss-120b`, when a model is rate-limited or unavailable.
+- The shared router observes 429 responses, skips depleted models for the remainder of the current Python process, and logs which model served each request. Crypto candidates remain retryable when the launch-founder verification stage cannot get a response from any model.
+- Added `GROQ_MODEL_FALLBACKS` configuration. No Apps Script changes are required for model routing.
