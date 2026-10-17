@@ -5,7 +5,7 @@ import math
 from datetime import datetime, timedelta, timezone
 
 from tracker_common import (
-    MODEL_CHAIN_LABEL, event_key, extract_json, fetch_google_news, fetch_official_social_links, fetch_rss_feed, groq_client,
+    MODEL_CHAIN_LABEL, event_key, extract_json, fetch_defillama_protocol_leads, fetch_google_news, fetch_official_social_links, fetch_rss_feed, groq_client,
     launch_signal_score, parse_event_date, post_rows, published_timestamp, verify_crypto_launch_quality, webhook_get,
 )
 from backfill_state import advance_window, choose_window, end_exclusive_today, leave_window_pending
@@ -52,8 +52,9 @@ PROMPT = r"""You are the first-stage triage analyst for a selective crypto/Web3 
  "confidence": "High|Medium|Low",
  "evidence_note": "evidence for launch status"
 }
-Qualifies only if the source explicitly announces a substantive new product/protocol/infrastructure launch. Exclude funding-only news, token-price news, airdrop speculation, routine feature updates, generic commentary and token-only launches without substantive product utility. Exclude projects primarily built around NFTs, PFPs, collectibles, NFT marketplaces, meme coins or meme tokens. A second stage will verify public founder identity and previous shipped Web3 builder experience. Do not invent facts. Return qualifies=false when irrelevant.
+For normal news sources, qualifies only if the source explicitly announces a substantive new product/protocol/infrastructure launch. For a source_type=defillama_protocol registry listing, treat it only as a discovery lead: qualify for second-stage research if it appears to be a substantive protocol and is not obviously NFT/meme-only, but DO NOT treat listedAt as launch date or the registry as launch proof. The second stage must find a separate credible launch announcement before any row is accepted. Exclude funding-only news, token-price news, airdrop speculation, routine feature updates, generic commentary and token-only launches without substantive product utility. Exclude projects primarily built around NFTs, PFPs, collectibles, NFT marketplaces, meme coins or meme tokens. A second stage verifies public founder identity and previous shipped Web3 builder experience. Do not invent facts.
 
+SOURCE TYPE: {source_type}
 PUBLISHER: {publisher}
 SOURCE URL: {link}
 DATE: {date}
@@ -111,6 +112,21 @@ def collect(window_start: str, window_end: str):
             published_date = parse_event_date(item)
             if item.get("link") and published_date != "Unknown" and window_start <= published_date < window_end:
                 items.setdefault(item["link"], item)
+
+    # Additional free structured discovery source. /protocols is public and requires no key;
+    # /api/raises is a paid endpoint and is intentionally not used. A registry listing is only
+    # a lead and never enough, by itself, to pass the launch/founder gate.
+    try:
+        protocol_leads = fetch_defillama_protocol_leads(window_start, window_end)
+        print(f"  DeFiLlama free /protocols leads listed in this window: {len(protocol_leads)}")
+        for item in protocol_leads:
+            items.setdefault(item["link"], item)
+        # Public X timelines are fetched only during stage-two verification, after a source
+        # passes candidate triage. This avoids wasting requests and keeps the source optional.
+    except Exception as exc:
+        query_errors.append(("DeFiLlama /protocols", str(exc)))
+        print(f"  [warn] free DeFiLlama /protocols source unavailable: {type(exc).__name__}: {exc}")
+
     return sorted(items.values(), key=published_timestamp, reverse=True), bool(query_errors)
 
 
@@ -165,7 +181,9 @@ def main():
 
     for idx, item in enumerate(fresh, 1):
         date = parse_event_date(item)
-        prompt = PROMPT.replace("{publisher}", item.get("publisher", "Unknown"))
+        row_date_fallback = "" if item.get("source_type") == "defillama_protocol" else date
+        prompt = PROMPT.replace("{source_type}", item.get("source_type", "rss"))
+        prompt = prompt.replace("{publisher}", item.get("publisher", "Unknown"))
         prompt = prompt.replace("{link}", item.get("link", "")).replace("{date}", date)
         prompt = prompt.replace("{title}", item.get("title", "")[:400]).replace("{body}", item.get("body", "")[:1800])
         print(f"[{idx}/{len(fresh)}] {item.get('title', '')[:90]}")
@@ -174,6 +192,12 @@ def main():
             failed_items.append(item["link"])
             print("  [warn] model extraction failed; this source will be retried")
             continue
+        if item.get("source_type") == "defillama_protocol":
+            data.setdefault("website", item.get("official_url") or "")
+            if not data.get("chain_ecosystem") and item.get("chains"):
+                data["chain_ecosystem"] = ", ".join(map(str, item.get("chains", [])))
+            # The model must not copy the DeFiLlama listing date into launch-date fields.
+            data["launch_date"] = None
         if not data.get("qualifies") or not data.get("project"):
             processed.append(item["link"])
             print("  - rejected at launch/category triage")
@@ -191,11 +215,13 @@ def main():
                 founders = vet.get("founders", [])
                 if not isinstance(previous_projects, list): previous_projects = [str(previous_projects)] if previous_projects else []
                 if not isinstance(founders, list): founders = [str(founders)] if founders else []
-                key = event_key(data.get("project"), data.get("launch_date") or date, data.get("signal_type", "Other"))
+                key = event_key(data.get("project"), data.get("launch_date") or vet.get("verified_launch_date") or (date if item.get("source_type") != "defillama_protocol" else "Unknown"), data.get("signal_type", "Other"))
                 official_links = fetch_official_social_links(data.get("website") or "")
+                x_user = item.get("_verified_x_user") or {}
+                x_handle = x_user.get("username") or item.get("x_handle") or ""
                 pending.append([
-                    data.get("launch_date") or date, data.get("project", ""), data.get("signal_type", "Other"),
-                    data.get("launch_date") or "", "", "", "", data.get("website") or "",
+                    data.get("launch_date") or vet.get("verified_launch_date") or row_date_fallback, data.get("project", ""), data.get("signal_type", "Other"),
+                    data.get("launch_date") or vet.get("verified_launch_date") or row_date_fallback, x_user.get("created_at", ""), f"@{x_handle}" if x_handle else "", x_user.get("url", f"https://x.com/{x_handle}" if x_handle else ""), data.get("website") or "",
                     data.get("broad_offerings", ""), data.get("niche_presence", ""), data.get("chain_ecosystem") or "",
                     "; ".join(founders), item.get("link", ""), "",
                     "Qualified: public founder + prior shipped Web3 work; NFT/meme excluded", vet.get("confidence", "Medium"),

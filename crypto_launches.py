@@ -1,10 +1,10 @@
 """Crypto Launch Radar: substantive launches only; NFT/meme and unverified teams excluded."""
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from tracker_common import (
-    MODEL_CHAIN_LABEL, account_freshness, event_key, extract_json, fetch_google_news, fetch_rss_feed,
+    MODEL_CHAIN_LABEL, account_freshness, event_key, extract_json, fetch_defillama_protocol_leads, fetch_google_news, fetch_rss_feed,
     fetch_official_social_links, groq_client, launch_signal_score, parse_event_date, post_rows, published_timestamp, verify_crypto_launch_quality,
     webhook_get, x_recent_search,
 )
@@ -54,7 +54,7 @@ PROMPT = r"""You are the first-stage triage analyst for a selective crypto/Web3 
  "confidence": "High|Medium|Low",
  "evidence_note": "what evidence supports the actual launch"
 }
-Set qualifies=false for funding-only news, generic commentary, established projects' minor updates, token-price news, airdrop speculation, token-only launches with no substantive product utility, or stories that do not explicitly announce a new product/protocol/infrastructure launch. Exclude projects primarily built around NFTs, PFPs, collectibles, NFT marketplaces, meme coins or meme tokens. This first stage only identifies likely candidates; a second stage verifies founder identity and previous shipped Web3 builder track record. Do not invent facts, founder names, URLs, or dates. Use an empty founders array when no names appear in this source.
+For normal news sources, qualifies=false unless there is a substantive launch signal. For source_type=defillama_protocol, treat the record only as a discovery lead: qualify for second-stage research only if the protocol appears substantive and not obviously NFT/meme-only; do NOT treat DeFiLlama's listedAt date as launch date or the listing as launch proof. The second stage must find an independent launch announcement. Exclude funding-only news, generic commentary, established projects' minor updates, token-price news, airdrop speculation, token-only launches with no substantive product utility, or stories that do not evidence a new product/protocol/infrastructure launch. Exclude NFT/PFP/collectibles-first and meme projects. Do not invent facts, founder names, URLs, or dates.
 
 Source type: {source_type}
 Publisher: {publisher}
@@ -75,6 +75,15 @@ def make_items():
         time.sleep(0.3)
     for query in X_QUERIES:
         items.extend(x_recent_search(query, max_results=70))
+    # Free structured listing data lets the live collector spot DeFi protocols with a recent
+    # listedAt timestamp. This is a candidate lead, not proof that a project has launched.
+    today = datetime.now(timezone.utc).date()
+    try:
+        leads = fetch_defillama_protocol_leads((today - timedelta(days=30)).isoformat(), (today + timedelta(days=1)).isoformat())
+        items.extend(leads)
+        print(f"[source] DeFiLlama public /protocols: {len(leads)} recent listing lead(s), no API key")
+    except Exception as exc:
+        print(f"[warn] free DeFiLlama /protocols source unavailable: {type(exc).__name__}")
     unique = {}
     for item in items:
         link = item.get("link")
@@ -117,6 +126,8 @@ def main():
 
     for idx, item in enumerate(fresh, 1):
         reported_date = parse_event_date(item)
+        # A DeFiLlama `listedAt` is a registry timestamp, not the actual launch/announcement date.
+        row_date_fallback = "" if item.get("source_type") == "defillama_protocol" else reported_date
         x_user = item.get("x_user", {})
         metadata = {
             "username": x_user.get("username"), "display_name": x_user.get("name"),
@@ -135,6 +146,12 @@ def main():
         if data is None:
             # Model failures are not marked processed, so the next hourly run may retry.
             continue
+        if item.get("source_type") == "defillama_protocol":
+            data.setdefault("website", item.get("official_url") or "")
+            if not data.get("chain_ecosystem") and item.get("chains"):
+                data["chain_ecosystem"] = ", ".join(map(str, item.get("chains", [])))
+            # The model must not copy the DeFiLlama listing date into launch-date fields.
+            data["launch_date"] = None
         if not data.get("qualifies") or not data.get("project"):
             processed.append(item["link"])
             print("  - rejected at launch/category triage")
@@ -149,20 +166,21 @@ def main():
             if not passed:
                 print(f"  - rejected by strict founder/track-record gate: {vet.get('quality_gate_reason', 'not enough verifiable evidence')}")
             else:
-                handle = x_user.get("username", "") if x_user else ""
-                account_created = x_user.get("created_at", "") if x_user else ""
-                profile_url = f"https://x.com/{handle}" if handle else ""
-                tweet_url = item.get("link", "") if item.get("source_type") == "x" else ""
+                x_user = item.get("_verified_x_user") or x_user or {}
+                handle = x_user.get("username") or item.get("x_handle", "") or ""
+                account_created = x_user.get("created_at", "")
+                profile_url = x_user.get("url") or (f"https://x.com/{handle}" if handle else "")
+                tweet_url = item.get("link", "") if item.get("source_type") in {"x", "x_syndication"} else ""
                 age_bucket = account_freshness(account_created)
-                key = event_key(data.get("project"), data.get("launch_date") or reported_date, data.get("signal_type", "Other"))
+                key = event_key(data.get("project"), data.get("launch_date") or vet.get("verified_launch_date") or (reported_date if item.get("source_type") != "defillama_protocol" else "Unknown"), data.get("signal_type", "Other"))
                 previous_projects = vet.get("previous_web3_projects", [])
                 founders = vet.get("founders", [])
                 if not isinstance(previous_projects, list): previous_projects = [str(previous_projects)] if previous_projects else []
                 if not isinstance(founders, list): founders = [str(founders)] if founders else []
                 official_links = fetch_official_social_links(data.get("website") or "")
                 row = [
-                    data.get("launch_date") or reported_date, data.get("project", ""), data.get("signal_type", "Other"),
-                    data.get("launch_date") or "", account_created, f"@{handle}" if handle else "", profile_url,
+                    data.get("launch_date") or vet.get("verified_launch_date") or row_date_fallback, data.get("project", ""), data.get("signal_type", "Other"),
+                    data.get("launch_date") or vet.get("verified_launch_date") or row_date_fallback, account_created, f"@{handle}" if handle else "", profile_url,
                     data.get("website") or "", data.get("broad_offerings", ""), data.get("niche_presence", ""),
                     data.get("chain_ecosystem") or "", "; ".join(founders), item.get("link", ""), tweet_url,
                     "Qualified: public founder + prior shipped Web3 work; NFT/meme excluded", vet.get("confidence", data.get("confidence", "Medium")),

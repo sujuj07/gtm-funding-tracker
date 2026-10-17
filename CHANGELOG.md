@@ -16,3 +16,10 @@
 - Adds a one-time manual `recheck_processed_sources` input so previously rejected crypto candidates can be re-evaluated after verification improvements.
 - Apps Script only bypasses the processed-source guard when an authenticated crypto POST explicitly asks to recheck; event keys/natural keys continue to prevent duplicate rows.
 - Keeps the core quality bar unchanged: substantive launch, non-NFT/non-meme, publicly named founder, and evidence of prior shipped Web3 building.
+
+
+## v11 — free crypto discovery sources
+- Added no-key DeFiLlama `/protocols` listing-date leads to historical and live crypto discovery. These are leads only; the paid `/api/raises` endpoint is not used.
+- Added best-effort public X profile timeline enrichment through the unauthenticated syndication page for handles identified from official/project sources. This unofficial endpoint covers recent posts on known profiles only; it is not keyword search or a full archive.
+- Verification now asks more directly for independent launch evidence and can use official-site-linked X posts as supporting evidence.
+- DeFiLlama `listedAt` is never copied into the sheet as a launch/announcement date.

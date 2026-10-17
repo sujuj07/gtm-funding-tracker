@@ -11,7 +11,7 @@ import re
 import time
 import urllib.parse
 from html.parser import HTMLParser
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import feedparser
@@ -193,6 +193,10 @@ _NOISE_ONLY_RE = re.compile(
 
 def launch_signal_score(item: dict[str, Any]) -> int:
     """Return 0 for non-launch-like news, otherwise rank stronger launch evidence higher."""
+    if str(item.get("source_type") or "") == "defillama_protocol":
+        # A recent structured registry listing is a discovery lead; second-stage evidence
+        # verification must still prove an actual launch before anything is written.
+        return 2 if item.get("official_url") else 1
     title = strip_html(str(item.get("title") or ""))
     body = strip_html(str(item.get("body") or ""))[:1800]
     title_has_cue = bool(_LAUNCH_CUE_RE.search(title))
@@ -268,6 +272,167 @@ def fetch_google_news(
 ) -> list[dict]:
     url = google_news_rss_url(query, after, before)
     return fetch_rss_feed(url, limit=limit, label="Google News: " + query, strict=strict)
+
+def _listing_date(value: Any) -> str:
+    """Parse DeFiLlama listedAt timestamps to an ISO UTC date."""
+    if value in (None, "", 0, "0"):
+        return ""
+    try:
+        if isinstance(value, (int, float)) or str(value).strip().replace(".", "", 1).isdigit():
+            number = float(value)
+            if number > 10_000_000_000:  # tolerate milliseconds
+                number /= 1000.0
+            return datetime.fromtimestamp(number, timezone.utc).strftime("%Y-%m-%d")
+        normalized = str(value).strip().replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d") if parsed.tzinfo else parsed.strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def fetch_defillama_protocol_leads(after: str, before: str) -> list[dict]:
+    """Free, no-key DeFiLlama /protocols feed, filtered by its listedAt field.
+
+    `listedAt` is a DeFiLlama listing timestamp, NOT a launch date. These records are
+    discovery leads only; downstream verification must find an independent launch source.
+    The paid /api/raises endpoint is deliberately not used here.
+    """
+    endpoint = "https://api.llama.fi/protocols"
+    response = requests.get(
+        endpoint, timeout=(5, 30),
+        headers={"User-Agent": "Mozilla/5.0 (compatible; StartupIntelligenceTracker/1.0)"},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise RuntimeError("DeFiLlama /protocols returned an unexpected schema")
+    records: list[dict] = []
+    seen: set[str] = set()
+    for protocol in payload:
+        if not isinstance(protocol, dict):
+            continue
+        listed_date = _listing_date(protocol.get("listedAt"))
+        if not listed_date or not (after <= listed_date < before):
+            continue
+        name = str(protocol.get("name") or "").strip()
+        if not name:
+            continue
+        raw_module = str(protocol.get("module") or protocol.get("slug") or name).strip()
+        # DeFiLlama's public page slug commonly follows the module's first path segment.
+        slug = raw_module.split("/", 1)[0].removesuffix(".js")
+        slug = re.sub(r"[^A-Za-z0-9._-]", "", slug) or re.sub(r"[^A-Za-z0-9._-]", "-", name.lower())
+        lead_url = f"https://defillama.com/protocol/{urllib.parse.quote(slug, safe='._-')}"
+        if lead_url in seen:
+            continue
+        seen.add(lead_url)
+        chains = protocol.get("chains") or []
+        if not isinstance(chains, list):
+            chains = [str(chains)] if chains else []
+        official_url = str(protocol.get("url") or "").strip()
+        twitter = str(protocol.get("twitter") or "").strip().lstrip("@")
+        category = str(protocol.get("category") or "").strip()
+        description = str(protocol.get("description") or "").strip()
+        tvl = protocol.get("tvl")
+        body = (
+            "DISCOVERY-ONLY REGISTRY RECORD. The listedAt value means DeFiLlama listing date, "
+            "not project launch date. Independent launch evidence is required. "
+            f"Name: {name}. Category: {category}. Chains: {', '.join(map(str, chains))}. "
+            f"Description: {description[:900]}. Official website: {official_url}. "
+            f"Public X handle listed by DeFiLlama: @{twitter if twitter else 'not provided'}. "
+            f"Current TVL field: {tvl}. DeFiLlama listedAt: {listed_date}."
+        )
+        records.append({
+            "title": f"DeFiLlama protocol listing lead: {name} ({category or 'category not supplied'})",
+            "body": body,
+            "link": lead_url,
+            "published": f"{listed_date}T00:00:00Z",
+            "published_parsed": None,
+            "publisher": "DeFiLlama public /protocols API",
+            "source_type": "defillama_protocol",
+            "official_url": official_url,
+            "x_handle": twitter,
+            "chains": list(map(str, chains)),
+            "listed_at": listed_date,
+        })
+    records.sort(key=lambda item: str(item.get("listed_at") or ""), reverse=True)
+    return records
+
+
+def _walk_dicts(value: Any):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_dicts(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_dicts(child)
+
+
+def fetch_x_public_timeline(username: str, max_posts: int = 20) -> list[dict]:
+    """Fetch recent posts from a known public X profile through the public syndication page.
+
+    This is an unofficial, best-effort profile timeline endpoint: no API key, no keyword
+    search, and no full archive. It is used only to enrich a known project profile found
+    by a separate source, never as the sole proof of a project or founder.
+    """
+    handle = str(username or "").strip().lstrip("@").strip("/")
+    if "x.com/" in handle or "twitter.com/" in handle:
+        parsed = urllib.parse.urlparse(handle if handle.startswith("http") else "https://" + handle)
+        parts = [part for part in parsed.path.split("/") if part]
+        handle = parts[0] if parts else ""
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,15}", handle):
+        return []
+    url = f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{urllib.parse.quote(handle)}"
+    try:
+        response = requests.get(
+            url, timeout=(4, 12), allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; StartupIntelligenceTracker/1.0)"},
+        )
+        if response.status_code in {403, 404, 429}:
+            print(f"  [x-public] timeline unavailable for @{handle}: HTTP {response.status_code}")
+            return []
+        response.raise_for_status()
+        match = re.search(r"""<script[^>]+id=["']__NEXT_DATA__["'][^>]*>(.*?)</script>""", response.text, re.I | re.S)
+        if not match:
+            print(f"  [x-public] no timeline JSON returned for @{handle}")
+            return []
+        data = json.loads(match.group(1))
+    except Exception as exc:
+        print(f"  [x-public] timeline unavailable for @{handle}: {type(exc).__name__}")
+        return []
+    output: list[dict] = []
+    seen_ids: set[str] = set()
+    for node in _walk_dicts(data):
+        legacy = node.get("legacy")
+        if not isinstance(legacy, dict):
+            continue
+        text = str(legacy.get("full_text") or legacy.get("text") or "").strip()
+        post_id = str(legacy.get("id_str") or node.get("rest_id") or "").strip()
+        if not text or not post_id or post_id in seen_ids:
+            continue
+        seen_ids.add(post_id)
+        core = node.get("core") if isinstance(node.get("core"), dict) else {}
+        user_result = core.get("user_results", {}).get("result", {}) if isinstance(core.get("user_results"), dict) else {}
+        user_legacy = user_result.get("legacy", {}) if isinstance(user_result, dict) else {}
+        screen_name = str(user_legacy.get("screen_name") or handle).strip()
+        created_at = str(legacy.get("created_at") or "")
+        output.append({
+            "title": f"Public X post from @{screen_name}",
+            "body": text[:2400],
+            "link": f"https://x.com/{screen_name}/status/{post_id}",
+            "published": created_at,
+            "published_parsed": None,
+            "publisher": "X public profile timeline (unofficial syndication)",
+            "source_type": "x_syndication",
+            "x_user": {"username": screen_name, "name": str(user_legacy.get("name") or ""),
+                       "created_at": str(user_legacy.get("created_at") or ""),
+                       "description": str(user_legacy.get("description") or ""),
+                       "url": f"https://x.com/{screen_name}"},
+        })
+        if len(output) >= max_posts:
+            break
+    output.sort(key=published_timestamp, reverse=True)
+    return output[:max_posts]
 
 def _as_name_list(value: Any) -> list[str]:
     if isinstance(value, list):
@@ -405,14 +570,15 @@ def fetch_research_page(url: str, *, source_label: str = "Web page", max_chars: 
 def _verification_queries(project: str, candidate: dict[str, Any], item: dict[str, Any], website_host: str = "") -> list[str]:
     title = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()[:140]
     queries = [
-        f'"{project}" founders team Web3',
+        f'"{project}" founder team Web3',
         f'"{project}" founder previous project crypto protocol',
-        f'"{project}" founder mainnet launch team',
+        f'"{project}" crypto protocol launch announcement',
+        f'"{project}" mainnet OR testnet launch',
     ]
-    # Short or ambiguous names such as "Arc" need the launch headline context to
-    # avoid searching an unrelated product with the same name.
+    # Context helps with short/ambiguous names like Arc, while the official-domain
+    # query helps recover founders from the project's own About/Team pages.
     if title:
-        queries.append(f'"{project}" {title} founder team blockchain')
+        queries.append(f'"{project}" {title} launch founder team blockchain')
     if website_host:
         queries.append(f'site:{website_host} founder OR team OR about OR leadership')
     for founder in _as_name_list(candidate.get("founders"))[:2]:
@@ -427,6 +593,14 @@ def _verification_queries(project: str, candidate: dict[str, Any], item: dict[st
 
 def verify_crypto_launch_quality(client: Groq, item: dict[str, Any], candidate: dict[str, Any], event_date: str) -> tuple[bool, dict[str, Any], list[str]]:
     """Require evidence of a real launch, publicly named founder, and prior shipped Web3 work."""
+    candidate = dict(candidate)
+    # Use only metadata supplied by the structured lead itself as fallback; never guess handles.
+    if not candidate.get("website") and item.get("official_url"):
+        candidate["website"] = item.get("official_url")
+    if not candidate.get("x_handle") and item.get("x_handle"):
+        candidate["x_handle"] = item.get("x_handle")
+    if not candidate.get("chain_ecosystem") and item.get("chains"):
+        candidate["chain_ecosystem"] = ", ".join(map(str, item.get("chains", [])))
     project = str(candidate.get("project") or "").strip()
     category = str(candidate.get("project_category") or "").strip()
     if not project or excluded_nft_or_meme(candidate):
@@ -448,6 +622,7 @@ def verify_crypto_launch_quality(client: Groq, item: dict[str, Any], candidate: 
             "title": str(record.get("title") or fallback_title or "Web source")[:300],
             "publisher": str(record.get("publisher") or "Unknown")[:100],
             "url": url,
+            "published_date": parse_event_date(record) if parse_event_date(record) != "Unknown" else "",
             "body": str(record.get("body") or "")[:1400],
         })
 
@@ -484,6 +659,47 @@ def verify_crypto_launch_quality(client: Groq, item: dict[str, Any], candidate: 
         for url, label in selected_links:
             add_evidence(fetch_research_page(url, source_label=f"Official website: {label}", max_chars=1800))
 
+    # Free, unofficial profile timeline is an enrichment source only. Obtain handles from
+    # the actual protocol record or links on the official website; never invent account names.
+    handles: list[str] = []
+    item_x_user = item.get("x_user") if isinstance(item.get("x_user"), dict) else {}
+    for raw_handle in (item.get("x_handle"), item_x_user.get("username"), candidate.get("x_handle"), candidate.get("twitter")):
+        raw = str(raw_handle or "").strip()
+        if raw:
+            if "x.com/" in raw or "twitter.com/" in raw:
+                parsed = urllib.parse.urlparse(raw if raw.startswith("http") else "https://" + raw)
+                parts = [part for part in parsed.path.split("/") if part]
+                raw = parts[0] if parts else ""
+            raw = raw.lstrip("@").strip()
+            if re.fullmatch(r"[A-Za-z0-9_]{1,15}", raw) and raw not in handles:
+                handles.append(raw)
+    if website_page:
+        for raw_url, _label in website_page.get("links", []):
+            parsed = urllib.parse.urlparse(raw_url)
+            host = (parsed.hostname or "").lower().removeprefix("www.")
+            if host not in {"x.com", "twitter.com"}:
+                continue
+            parts = [part for part in parsed.path.split("/") if part]
+            if parts and parts[0].lower() not in {"home", "search", "intent", "share", "i", "explore"}:
+                handle = parts[0].lstrip("@").strip()
+                if re.fullmatch(r"[A-Za-z0-9_]{1,15}", handle) and handle not in handles:
+                    handles.append(handle)
+    for handle in handles[:2]:
+        timeline = fetch_x_public_timeline(handle, max_posts=20)
+        print(f"  [x-public] @{handle}: {len(timeline)} recent public posts returned (unofficial endpoint)")
+        if timeline:
+            profile = timeline[0].get("x_user") or {}
+            item["_verified_x_user"] = {
+                "username": profile.get("username") or handle,
+                "name": profile.get("name") or "",
+                "created_at": profile.get("created_at") or "",
+                "description": profile.get("description") or "",
+                "url": profile.get("url") or f"https://x.com/{handle}",
+            }
+        relevant = [post for post in timeline if launch_signal_score(post) > 0 or re.search(r"\b(founder|co-founder|built|building|previously|formerly|mainnet|testnet|protocol launch|we launched|our launch)\b", post.get("body", ""), re.I)]
+        for post in relevant[:6]:
+            add_evidence({"title": post.get("title", ""), "publisher": post.get("publisher", "X public timeline"),
+                          "url": post.get("link", ""), "body": post.get("body", "")[:1400]})
     queries = _verification_queries(project, candidate, item, website_host)
     query_result_count = 0
     for query in queries:
@@ -561,10 +777,11 @@ SOURCES: """ + json.dumps(evidence[:10], ensure_ascii=False) + "\n"
  "founder_evidence_url": "exact URL from evidence or empty",
  "track_record_evidence_url": "exact URL from evidence or empty",
  "launch_evidence_url": "exact URL from evidence or empty",
+ "verified_launch_date": "YYYY-MM-DD only if directly stated by launch evidence; otherwise empty",
  "confidence": "High|Medium|Low",
  "quality_gate_reason": "brief factual reason"
 }
-PASS ONLY if all are evidenced: (1) the source explicitly announces a substantive new product/protocol/mainnet/testnet/developer infrastructure/wallet/security/DeFi/payments launch; (2) the project is NOT primarily NFT/PFP/collectibles or a meme coin/token and is not a token-only launch without substantive product utility; (3) at least one project founder or explicitly identified founding team member is publicly named in supplied source material; (4) at least one named founder previously built/shipped a real Web3 product/protocol or founded a Web3 company with a product. Merely working in crypto, advising, investing, marketing, influencing, running a community or making an unshipped announcement does not qualify. Do not infer identity from a pseudonymous X handle. Do not use model memory as evidence. Do not invent names, roles, projects or URLs. Every evidence URL must exactly match a URL in the supplied source list. If any criterion lacks evidence, fail closed and explain which evidence is missing. Prefer credible media, official team/about pages, project documentation, GitHub organizations or verifiable prior-project sources.
+PASS ONLY if all are evidenced: (1) a supplied source independent of any DeFiLlama registry explicitly announces a substantive new product/protocol/mainnet/testnet/developer infrastructure/wallet/security/DeFi/payments launch; (2) the project is NOT primarily NFT/PFP/collectibles or a meme coin/token and is not a token-only launch without substantive product utility; (3) at least one project founder or explicitly identified founding team member is publicly named in supplied source material; (4) at least one named founder previously built/shipped a real Web3 product/protocol or founded a Web3 company with a product. Merely working in crypto, advising, investing, marketing, influencing, running a community or making an unshipped announcement does not qualify. Do not infer identity from a pseudonymous X handle. Do not use model memory as evidence. Do not invent names, roles, projects or URLs. Every evidence URL must exactly match a URL in the supplied source list. `verified_launch_date` may only be returned when an independent launch source explicitly supports it; never use DeFiLlama listedAt as launch date. If any criterion lacks evidence, fail closed and explain which evidence is missing. Prefer credible media, official team/about pages, project documentation, GitHub organizations or verifiable prior-project sources.
 
 INITIAL CANDIDATE:
 """ + json.dumps(verification_candidate, ensure_ascii=False) + r"""
@@ -585,6 +802,16 @@ PROJECT / FOUNDER SEARCH RESULTS AND OFFICIAL WEB PAGES:
     track_url = str(verified.get("track_record_evidence_url") or "").strip()
     launch_url = str(verified.get("launch_evidence_url") or "").strip()
     category_out = str(verified.get("project_category") or category).strip()
+    verified_launch_date = str(verified.get("verified_launch_date") or "").strip()
+    try:
+        datetime.strptime(verified_launch_date, "%Y-%m-%d")
+    except Exception:
+        verified_launch_date = ""
+    launch_evidence_record = next((entry for entry in evidence if entry.get("url") == launch_url), None)
+    if not launch_evidence_record or str(launch_evidence_record.get("publisher") or "").lower().startswith("defillama"):
+        verified_launch_date = ""
+    if item.get("source_type") == "defillama_protocol" and verified_launch_date == str(item.get("listed_at") or ""):
+        verified_launch_date = ""
     exclusion_check = {"is_nft_or_meme_project": verified.get("is_nft_or_meme_project") is True,
                        "project_category": category_out}
     passed = all((verified.get("quality_gate_pass") is True, verified.get("launch_verified") is True,
@@ -602,6 +829,7 @@ PROJECT / FOUNDER SEARCH RESULTS AND OFFICIAL WEB PAGES:
     verified["track_record_evidence_url"] = track_url if track_url in allowed_urls else ""
     verified["launch_evidence_url"] = launch_url if launch_url in allowed_urls else ""
     verified["quality_gate_pass"] = bool(passed)
+    verified["verified_launch_date"] = verified_launch_date
     if not passed and not verified.get("quality_gate_reason"):
         verified["quality_gate_reason"] = "Failed a required evidence check: launch, non-NFT/non-meme category, public founder, previous shipped Web3 work, evidence URLs or confidence."
     urls = []

@@ -121,3 +121,16 @@ The crypto launch pipeline now searches more specific launch phrases and press-r
 Logs now report the raw source count, how many new sources were found, how many lacked a clear launch cue, and how many launch-like candidates were sent to the model. The founder and previous-shipped-Web3-project verification requirements remain strict; NFTs and meme projects remain excluded.
 
 To deploy: replace the matching repository files from the v9 patch, commit and push to `main`, then manually run `backfill-crypto-launch-radar` once. Do **not** reset the cursor for this patch. The current cursor remains at its pending week; the updated queries and prefilter will apply to that window. The backfill remains scheduled hourly, with a larger candidate cap now that irrelevant headlines are screened before model calls.
+
+
+### Free crypto discovery sources (v11)
+- DeFiLlama `https://api.llama.fi/protocols` is a no-key structured source. The pipeline uses `listedAt` only as a **discovery timestamp**, never as the actual launch date; independent launch evidence is still required.
+- DeFiLlama's `https://api.llama.fi/api/raises` is not a free endpoint in the current official docs, so the tracker does not call it.
+- For a project handle found in DeFiLlama or linked from the official website, the tracker may fetch its recent public X profile timeline via the unofficial syndication endpoint. This is best-effort, only covers known public profiles/recent posts, has no keyword search, and may stop working or rate-limit at any time. It is not used as a guaranteed search/archive source.
+- Google News RSS and RSS feeds remain the broad discovery mechanism; no paid X token is required. If `X_BEARER_TOKEN` is configured, official Recent Search is used for posts from the last seven days.
+
+
+## v11 free-source crypto discovery
+This update supplements RSS/Google News with DeFiLlama's public no-key `/protocols` endpoint and uses public X profile syndication only when a project handle has already been discovered from an official/source record. It does not call DeFiLlama `/api/raises` (paid) or require an X API token. The syndication endpoint is unofficial, recent-profile-only, and may stop working. Neither route is a replacement for X keyword/full-archive search.
+
+To apply v11, replace `tracker_common.py`, `backfill_crypto.py`, `crypto_launches.py`, `README.md`, and `CHANGELOG.md`, then commit/push to `main`. The Apps Script schema is unchanged, so no Apps Script redeploy is required. Re-run `backfill-crypto-launch-radar` with `reset_cursor=false`; existing processed URLs remain deduplicated. DeFiLlama `listedAt` is never written as the launch date.
