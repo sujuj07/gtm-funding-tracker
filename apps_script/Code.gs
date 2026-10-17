@@ -13,6 +13,7 @@ function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Tracker Tools')
     .addItem('Format Crypto Launch Radar', 'formatCryptoLaunchRadar')
+    .addItem('Format Crypto Review Queue', 'formatCryptoReviewQueue')
     .addToUi();
 }
 
@@ -21,6 +22,133 @@ function formatCryptoLaunchRadar() {
   formatTrackerSheet(sheet, 'crypto');
   SpreadsheetApp.getActiveSpreadsheet().toast('Crypto Launch Radar formatting applied.', 'Tracker Tools', 5);
 }
+
+function formatCryptoReviewQueue() {
+  const sheet = getCryptoReviewSheet();
+  formatReviewQueueSheet(sheet);
+  SpreadsheetApp.getActiveSpreadsheet().toast('Crypto Review Queue formatting applied.', 'Tracker Tools', 5);
+}
+
+const CRYPTO_REVIEW_SHEET_NAME = 'Crypto Review Queue';
+const REVIEW_HEADERS = [
+  'First Seen UTC', 'Project', 'Signal Type', 'Verified Launch Date', 'Website',
+  'What It Builds', 'Niche / Use Case', 'Chain / Ecosystem', 'Founder Names Mentioned',
+  'Discovery Source URL', 'Founder Evidence URL', 'Prior Web3 Work Evidence URL',
+  'Other Evidence URLs', 'Review Status', 'Missing Evidence / Gate Reason', 'Project Category',
+  'Evidence Confidence', 'Last Checked UTC', 'Source Type', 'Source Title', 'Source Publisher',
+  'Review Dedupe Key', 'Manual Decision', 'Reviewer Notes', 'Source Published Date', 'Source Summary Snippet'
+];
+
+function getCryptoReviewSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(CRYPTO_REVIEW_SHEET_NAME);
+  if (!sheet) sheet = ss.insertSheet(CRYPTO_REVIEW_SHEET_NAME);
+  if (sheet.getMaxColumns() < REVIEW_HEADERS.length) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), REVIEW_HEADERS.length - sheet.getMaxColumns());
+  }
+  sheet.getRange(1, 1, 1, REVIEW_HEADERS.length).setValues([REVIEW_HEADERS]);
+  return sheet;
+}
+
+function formatReviewQueueSheet(sheet, rowsJustInserted) {
+  const width = REVIEW_HEADERS.length;
+  const lastRow = Math.max(sheet.getLastRow(), 1);
+  sheet.getRange(1, 1, 1, width)
+    .setBackground('#202124').setFontColor('#FFFFFF').setFontFamily('Arial')
+    .setFontSize(10).setFontWeight('bold').setWrap(true)
+    .setVerticalAlignment('middle').setHorizontalAlignment('center');
+  sheet.setRowHeight(1, 38);
+  sheet.setFrozenRows(1);
+  sheet.setFrozenColumns(2);
+  const widths = {
+    1: 150, 2: 210, 3: 155, 4: 135, 5: 230, 6: 320, 7: 260, 8: 200,
+    9: 230, 10: 300, 11: 280, 12: 280, 13: 320, 14: 260, 15: 380,
+    16: 190, 17: 150, 18: 165, 19: 180, 20: 330, 21: 180, 22: 180, 23: 180, 24: 300, 25: 155, 26: 380
+  };
+  Object.keys(widths).forEach(function (col) { sheet.setColumnWidth(Number(col), widths[col]); });
+  if (lastRow > 1) {
+    const rowCount = (rowsJustInserted === undefined) ? lastRow - 1 : Math.min(Math.max(0, rowsJustInserted), lastRow - 1);
+    if (rowCount > 0) {
+      const body = sheet.getRange(2, 1, rowCount, width);
+      body.setFontFamily('Arial').setFontSize(10).setFontColor('#202124').setVerticalAlignment('middle').setWrap(true);
+      const backgrounds = [];
+      const status = sheet.getRange(2, 14, rowCount, 1).getValues().flat();
+      for (let i = 0; i < rowCount; i++) {
+        const row = new Array(width).fill(i % 2 === 0 ? '#FFFFFF' : '#F3F4F6');
+        const value = String(status[i] || '').toLowerCase();
+        if (value.indexOf('qualified') >= 0 || value.indexOf('promoted') >= 0) row[13] = '#D9EAD3';
+        else if (value.indexOf('retry') >= 0) row[13] = '#FCE5CD';
+        else row[13] = '#FFF2CC';
+        backgrounds.push(row);
+      }
+      body.setBackgrounds(backgrounds);
+      sheet.setRowHeights(2, rowCount, 48);
+      [5, 10, 11, 12, 13].forEach(function (col) {
+        sheet.getRange(2, col, rowCount, 1).setFontColor('#1155CC').setFontLine('underline');
+      });
+    }
+  }
+  sheet.hideColumns(22);
+  const currentFilter = sheet.getFilter();
+  if (!currentFilter) sheet.getRange(1, 1, Math.max(2, lastRow), width).createFilter();
+  else if (currentFilter.getRange().getLastRow() < lastRow) {
+    currentFilter.remove();
+    sheet.getRange(1, 1, Math.max(2, lastRow), width).createFilter();
+  }
+}
+
+function upsertCryptoReviewRows(rows) {
+  if (!Array.isArray(rows) || !rows.length) return { appended: 0, updated: 0 };
+  const sheet = getCryptoReviewSheet();
+  const width = REVIEW_HEADERS.length;
+  const keyCol = 22;
+  const lastRow = sheet.getLastRow();
+  const rowByKey = {};
+  if (lastRow >= 2) {
+    sheet.getRange(2, keyCol, lastRow - 1, 1).getValues().flat().forEach(function (value, offset) {
+      if (value) rowByKey[String(value)] = offset + 2;
+    });
+  }
+  const updates = [];
+  const additions = [];
+  const seen = {};
+  rows.forEach(function (incomingValue) {
+    if (!Array.isArray(incomingValue) || incomingValue.length < keyCol) return;
+    const incoming = incomingValue.slice(0, width);
+    while (incoming.length < width) incoming.push('');
+    const key = String(incoming[keyCol - 1] || '').trim();
+    const project = String(incoming[1] || '').trim();
+    if (!key || !project || seen[key]) return;
+    seen[key] = true;
+    const rowNum = rowByKey[key];
+    if (!rowNum) {
+      additions.push(incoming);
+      return;
+    }
+    const existing = sheet.getRange(rowNum, 1, 1, width).getValues()[0];
+    // Preserve First Seen, the machine dedupe key, and human review fields.
+    for (let i = 1; i < width; i++) {
+      if (i === 21 || i === 22 || i === 23) continue;
+      if (i === 12) continue; // merge evidence URLs below
+      if (incoming[i] !== '' && incoming[i] !== null && incoming[i] !== undefined) existing[i] = incoming[i];
+    }
+    const evidence = String(existing[12] || '').split(/\n/).map(function (x) { return x.trim(); }).filter(Boolean);
+    String(incoming[12] || '').split(/\n/).map(function (x) { return x.trim(); }).filter(Boolean).forEach(function (url) {
+      if (evidence.indexOf(url) < 0) evidence.push(url);
+    });
+    existing[12] = evidence.join('\n');
+    existing[21] = key;
+    updates.push({ row: rowNum, values: existing });
+  });
+  updates.forEach(function (item) { sheet.getRange(item.row, 1, 1, width).setValues([item.values]); });
+  if (additions.length) {
+    sheet.insertRowsBefore(2, additions.length);
+    sheet.getRange(2, 1, additions.length, width).setValues(additions);
+  }
+  formatReviewQueueSheet(sheet, additions.length);
+  return { appended: additions.length, updated: updates.length };
+}
+
 
 const STREAMS = {
   funding: { sheetName: FUNDING_SHEET_NAME, companyCol: 2, sourceCol: 16, keyCol: 19, additionalSourcesCol: 31, lastCheckedCol: 29, maxCol: 31 },
@@ -310,6 +438,8 @@ function doPost(e) {
     const keyRows = getKeyRowMap(stream, sheet);
     const naturalRows = getNaturalEventRowMap(stream, sheet);
     const rows = Array.isArray(body.rows) ? body.rows : [];
+    const reviewRows = Array.isArray(body.reviewRows) ? body.reviewRows : [];
+    if (reviewRows.length && stream !== 'crypto') throw new Error('reviewRows are only valid for stream=crypto');
     const batchSources = {};
     const batchKeys = {};
     const toAdd = [];
@@ -352,15 +482,22 @@ function doPost(e) {
       sheet.getRange(2, 1, normalized.length, width).setValues(normalized);
     }
 
+    // Write the review queue before marking sources processed. If the queue write fails,
+    // the request returns ok:false and the Python backfill keeps the entire batch retryable.
+    const reviewResult = reviewRows.length ? upsertCryptoReviewRows(reviewRows) : { appended: 0, updated: 0 };
+
     // Apply the crypto presentation after inserts/updates so newly added rows match the table style.
     formatTrackerSheet(sheet, stream, toAdd.length);
 
-    // Mark all inspected source URLs, including irrelevant stories, so backfills progress across runs.
+    // Mark all inspected source URLs, including rejected stories and queued candidates, only
+    // after all sheet writes have completed successfully.
     const processed = (Array.isArray(body.processedSources) ? body.processedSources : []).concat(
       rows.map(function (row) { return Array.isArray(row) ? row[config.sourceCol - 1] : ''; })
     );
     recordProcessedSources(stream, processed);
-    return jsonOut({ ok: true, stream: stream, appended: toAdd.length, updated: toUpdate.length, skipped: skipped, processed: processed.length });
+    return jsonOut({ ok: true, stream: stream, appended: toAdd.length, updated: toUpdate.length,
+      reviewAppended: reviewResult.appended, reviewUpdated: reviewResult.updated,
+      skipped: skipped, processed: processed.length });
   } catch (err) {
     return jsonOut({ ok: false, error: String(err) });
   } finally {
@@ -386,6 +523,20 @@ function doGet(e) {
       const set = {};
       names.forEach(function (name) { const norm = normalizeCompany(name); if (norm) set[norm] = true; });
       return jsonOut({ ok: true, stream: stream, companies: Object.keys(set) });
+    }
+    if (action === 'review_queue') {
+      if (stream !== 'crypto') return jsonOut({ ok: false, error: 'review_queue requires stream=crypto' });
+      const reviewSheet = getCryptoReviewSheet();
+      const reviewLast = reviewSheet.getLastRow();
+      const reviewRows = reviewLast < 2 ? [] : reviewSheet.getRange(2, 1, reviewLast - 1, REVIEW_HEADERS.length).getValues();
+      // Return only unresolved candidates; promoted/excluded rows stay visible in Sheets for audit.
+      const unresolved = reviewRows.filter(function (row) {
+        const status = String(row[13] || '').toLowerCase();
+        const decision = String(row[22] || '').toLowerCase();
+        return status.indexOf('qualified') !== 0 && status.indexOf('excluded') !== 0 &&
+          decision !== 'reject' && decision !== 'rejected' && decision !== 'ignore';
+      });
+      return jsonOut({ ok: true, stream: stream, rows: unresolved });
     }
     return jsonOut({ ok: true, message: action === 'format' ? 'sheet formatting applied' : 'webhook live', stream: stream, sheet: sheet.getName() });
   } catch (err) {

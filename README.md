@@ -144,3 +144,11 @@ Set a GitHub Actions repository secret named `ROOTDATA_API_KEY` to enable RootDa
 Credit protection: each workflow checks the free RootData quota endpoint before a project-detail request; the tracker reserves at least 200 credits on the account, caps its own spend at 24 credits/day and 800 credits/month, and caches detail lookups in `.backfill-state/rootdata-state.json`. Search hits/misses are cached too. The live crypto and crypto-backfill workflows serialize access to this ledger and persist it to `main`. At most 12 uncached project-detail requests per UTC day are possible under the daily cap (2 credits each); cached lookups cost 0 additional credits. If the quota endpoint cannot confirm remaining credits, paid detail lookups are skipped, and the pipeline continues with existing sources.
 
 RootData records are metadata only. A project listing/description never satisfies the independent launch-announcement, named-founder, or prior shipped Web3-builder evidence requirements. Funding and investor fields are intentionally ignored because they are not included in the Basic plan shown for this key. The tracker still works without `ROOTDATA_API_KEY`.
+
+## Crypto Review Queue (v14)
+
+Plausible launch candidates that fail strict verification are preserved in the visible `Crypto Review Queue` instead of vanishing from the workflow. The primary `Crypto Launch Radar` continues to require independent launch evidence, a publicly named founder, and a documented previous shipped Web3 build. NFT/meme-first projects are not queued for qualification.
+
+The `recheck-crypto-review-queue` GitHub Actions workflow runs daily and rechecks at most five unresolved entries whose last check was at least seven days ago. Successful candidates are promoted to the main tracker; other entries retain an updated reason and evidence links. Set `Manual Decision` to `Reject`, `Rejected`, `Ignore`, or `Ignored` to stop automatic rechecks for a row.
+
+See `V14-INSTALL.md` for deployment steps. Updating the repository alone does not update the deployed Apps Script; deploy a new Apps Script version while preserving the existing `SECRET_TOKEN`.

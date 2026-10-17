@@ -5,7 +5,7 @@ import math
 from datetime import datetime, timedelta, timezone
 
 from tracker_common import (
-    MODEL_CHAIN_LABEL, event_key, extract_json, fetch_defillama_protocol_leads, fetch_google_news, fetch_official_social_links, fetch_rss_feed, groq_client,
+    MODEL_CHAIN_LABEL, event_key, excluded_nft_or_meme, extract_json, fetch_defillama_protocol_leads, fetch_google_news, fetch_official_social_links, fetch_rss_feed, groq_client,
     launch_signal_score, parse_event_date, post_rows, published_timestamp, verify_crypto_launch_quality, webhook_get,
 )
 from backfill_state import advance_window, choose_window, end_exclusive_today, leave_window_pending
@@ -130,6 +130,77 @@ def collect(window_start: str, window_end: str):
     return sorted(items.values(), key=published_timestamp, reverse=True), bool(query_errors)
 
 
+def _list_value(value):
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if isinstance(value, str) and value.strip():
+        return [x.strip() for x in value.split(";") if x.strip()]
+    return []
+
+
+def _hard_excluded(data: dict, vet: dict) -> bool:
+    """Exclude explicit NFT/meme-first projects from both the main sheet and review queue."""
+    merged = dict(data or {})
+    for key in ("is_nft_or_meme_project", "project_category", "crypto_project_category", "project_type", "sector"):
+        if vet.get(key) not in (None, ""):
+            merged[key] = vet[key]
+    return excluded_nft_or_meme(merged)
+
+
+def build_review_row(item: dict, data: dict, vet: dict, evidence_urls: list[str], source_date: str,
+                     *, passed: bool = False) -> list:
+    """Build a transparent review-queue row for candidates failing only the evidence gate."""
+    project = str(data.get("project") or item.get("project") or "").strip()
+    signal_type = str(data.get("signal_type") or "Potential launch").strip()
+    verified_launch_date = str(vet.get("verified_launch_date") or "").strip()
+    if item.get("source_type") == "defillama_protocol":
+        # listedAt is never a launch date.
+        source_date = ""
+        if verified_launch_date == str(item.get("listed_at") or ""):
+            verified_launch_date = ""
+    reason = str(vet.get("quality_gate_reason") or "Evidence did not yet meet all launch/founder requirements.").strip()
+    if passed:
+        status = "Qualified — promoted to main tracker"
+        reason = "All strict qualification criteria verified; record written to Crypto Launch Radar."
+    elif reason == "No successful verification response.":
+        status = "Retry required — verification service unavailable"
+    elif not vet.get("launch_verified") and item.get("source_type") == "defillama_protocol":
+        status = "Needs independent launch evidence"
+    elif not vet.get("founders_publicly_identified"):
+        status = "Needs named founder evidence"
+    elif not vet.get("prior_web3_builder_track_record"):
+        status = "Needs prior Web3 build evidence"
+    else:
+        status = "Needs evidence review"
+
+    founders = _list_value(vet.get("founders") or data.get("founders"))
+    other_urls = []
+    for url in [*(evidence_urls or []), item.get("link", ""), data.get("website", ""),
+                vet.get("founder_evidence_url", ""), vet.get("track_record_evidence_url", ""),
+                vet.get("launch_evidence_url", "")]:
+        url = str(url or "").strip()
+        if url.startswith(("http://", "https://")) and url not in other_urls:
+            other_urls.append(url)
+    # Keep the queue key stable across later verification improvements. The newly
+    # verified launch date may appear on a recheck; it must not create a second queue row.
+    key_date = source_date if item.get("source_type") != "defillama_protocol" else ""
+    review_key = event_key(project, key_date, "review:" + signal_type)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return [
+        now, project, signal_type, verified_launch_date, str(data.get("website") or item.get("official_url") or ""),
+        str(data.get("broad_offerings") or ""), str(data.get("niche_presence") or ""),
+        str(data.get("chain_ecosystem") or ", ".join(item.get("chains") or [])),
+        "; ".join(founders), str(item.get("link") or ""), str(vet.get("founder_evidence_url") or ""),
+        str(vet.get("track_record_evidence_url") or ""), "\n".join(other_urls), status, reason,
+        str(vet.get("project_category") or data.get("project_category") or "Unknown"),
+        str(vet.get("confidence") or data.get("confidence") or "Low"), now,
+        str(item.get("source_type") or "unknown"), str(item.get("title") or ""),
+        str(item.get("publisher") or ""), review_key, "", "",
+        "" if item.get("source_type") == "defillama_protocol" or source_date == "Unknown" else source_date,
+        str(item.get("body") or "")[:1800],
+    ]
+
+
 def main():
     window = choose_window(STREAM, DATE_FROM, DATE_TO, WINDOW_DAYS)
     if window is None:
@@ -160,24 +231,39 @@ def main():
         for example in examples:
             print(f"  [prefilter] no clear launch cue: {example}")
     client = groq_client()
-    pending, processed, appended, updated = [], [], 0, 0
+    pending, processed, review_pending, appended, updated = [], [], [], 0, 0
     flush_unconfirmed = False
     failed_items = []
 
     def flush():
-        nonlocal pending, processed, appended, updated, flush_unconfirmed
-        if not pending and not processed:
-            return
-        result = post_rows(STREAM, pending, processed_sources=processed, allow_reprocessed_sources=RECHECK_PROCESSED_SOURCES)
-        if result and result.get("ok"):
-            appended += result.get("appended", 0)
-            updated += result.get("updated", 0)
-            print(f"  [save] appended={result.get('appended', 0)} updated={result.get('updated', 0)} skipped={result.get('skipped', 0)}")
-            pending, processed = [], []
-            flush_unconfirmed = False
-        else:
-            print("  [warn] webhook batch failed; keeping the current date window pending")
+        nonlocal pending, processed, review_pending, appended, updated, flush_unconfirmed
+        if not pending and not processed and not review_pending:
+            return True
+        # Retry transient Apps Script failures while keeping every unconfirmed item buffered.
+        # A successful retry sends the entire retained buffer, so the registry and review rows
+        # are confirmed together; otherwise the historical cursor must remain stationary.
+        for attempt in range(1, 4):
+            result = post_rows(
+                STREAM, pending, processed_sources=processed,
+                allow_reprocessed_sources=RECHECK_PROCESSED_SOURCES,
+                review_rows=review_pending,
+            )
+            if result and result.get("ok"):
+                appended += result.get("appended", 0)
+                updated += result.get("updated", 0)
+                print(
+                    f"  [save] main_appended={result.get('appended', 0)} main_updated={result.get('updated', 0)} "
+                    f"review_added={result.get('reviewAppended', 0)} review_updated={result.get('reviewUpdated', 0)} "
+                    f"skipped={result.get('skipped', 0)} processed_confirmed={result.get('processed', 0)}"
+                )
+                pending, processed, review_pending = [], [], []
+                flush_unconfirmed = False
+                return True
             flush_unconfirmed = True
+            print(f"  [warn] webhook batch unconfirmed (attempt {attempt}/3); keeping records buffered")
+            if attempt < 3:
+                time.sleep(2 ** attempt)
+        return False
 
     for idx, item in enumerate(fresh, 1):
         date = parse_event_date(item)
@@ -204,26 +290,38 @@ def main():
         else:
             passed, vet, evidence_urls = verify_crypto_launch_quality(client, item, data, date)
             if vet.get("quality_gate_reason") == "No successful verification response.":
+                if not _hard_excluded(data, vet):
+                    review_pending.append(build_review_row(item, data, vet, evidence_urls, date))
+                    print("  [review-queue] verification service unavailable; retained candidate for retry")
                 failed_items.append(item["link"])
-                print("  [warn] founder verification could not reach a model; date window will be retried")
+                print("  [warn] founder verification could not reach a model; source remains unprocessed and date window will be retried")
+                if len(review_pending) >= SAVE_BATCH_SIZE:
+                    flush()
                 continue
-            processed.append(item["link"])
             if not passed:
                 print(f"  - rejected by strict founder/track-record gate: {vet.get('quality_gate_reason', 'not enough verifiable evidence')}")
+                if not _hard_excluded(data, vet):
+                    review_pending.append(build_review_row(item, data, vet, evidence_urls, date))
+                    print(f"  [review-queue] retained {data.get('project')} separately; main sheet remains strict")
+                processed.append(item["link"])
             else:
                 previous_projects = vet.get("previous_web3_projects", [])
                 founders = vet.get("founders", [])
                 if not isinstance(previous_projects, list): previous_projects = [str(previous_projects)] if previous_projects else []
                 if not isinstance(founders, list): founders = [str(founders)] if founders else []
-                key = event_key(data.get("project"), data.get("launch_date") or vet.get("verified_launch_date") or (date if item.get("source_type") != "defillama_protocol" else "Unknown"), data.get("signal_type", "Other"))
+                verified_launch_date = str(vet.get("verified_launch_date") or "").strip()
+                # Do not write a model-inferred launch date as fact. Column D is populated
+                # only when the independent launch evidence verified an explicit date.
+                key = event_key(data.get("project"), verified_launch_date or (date if item.get("source_type") != "defillama_protocol" else "Unknown"), data.get("signal_type", "Other"))
                 official_links = fetch_official_social_links(data.get("website") or "")
                 x_user = item.get("_verified_x_user") or {}
                 x_handle = x_user.get("username") or item.get("x_handle") or ""
+                verified_launch_source = str(vet.get("launch_evidence_url") or item.get("link") or "")
                 pending.append([
-                    data.get("launch_date") or vet.get("verified_launch_date") or row_date_fallback, data.get("project", ""), data.get("signal_type", "Other"),
-                    data.get("launch_date") or vet.get("verified_launch_date") or row_date_fallback, x_user.get("created_at", ""), f"@{x_handle}" if x_handle else "", x_user.get("url", f"https://x.com/{x_handle}" if x_handle else ""), data.get("website") or "",
+                    date if item.get("source_type") != "defillama_protocol" else "", data.get("project", ""), data.get("signal_type", "Other"),
+                    verified_launch_date, x_user.get("created_at", ""), f"@{x_handle}" if x_handle else "", x_user.get("url", f"https://x.com/{x_handle}" if x_handle else ""), data.get("website") or "",
                     data.get("broad_offerings", ""), data.get("niche_presence", ""), data.get("chain_ecosystem") or "",
-                    "; ".join(founders), item.get("link", ""), "",
+                    "; ".join(founders), verified_launch_source, "",
                     "Qualified: public founder + prior shipped Web3 work; NFT/meme excluded", vet.get("confidence", "Medium"),
                     datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), key, "Unknown",
                     "\n".join(evidence_urls), True, True, "; ".join(previous_projects),
@@ -232,8 +330,12 @@ def main():
                     vet.get("quality_gate_reason", "Passed all quality checks"),
                     "; ".join(official_links),
                 ])
+                # If this project already exists in the review queue, update its status to promoted.
+                if vet.get("launch_evidence_url"):
+                    review_pending.append(build_review_row(item, data, vet, evidence_urls, date, passed=True))
+                processed.append(item["link"])
                 print(f"  + QUALIFIED {data.get('project')} | {data.get('signal_type')} | founder history verified")
-        if len(pending) >= SAVE_BATCH_SIZE or len(processed) >= SAVE_BATCH_SIZE:
+        if (len(pending) + len(review_pending) >= SAVE_BATCH_SIZE) or len(processed) >= SAVE_BATCH_SIZE:
             flush()
         time.sleep(DELAY)
     flush()

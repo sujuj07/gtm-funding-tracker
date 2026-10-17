@@ -1,0 +1,39 @@
+name: recheck-crypto-review-queue
+
+on:
+  # Re-evaluate unresolved projects once daily; the script only spends model calls on
+  # rows whose last check is at least seven days old. RootData detail credits are not used.
+  schedule:
+    - cron: "15 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: startup-intelligence-crypto-review-recheck
+  cancel-in-progress: false
+
+jobs:
+  recheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Recheck due unresolved crypto candidates
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GROQ_MODEL: qwen/qwen3.8-27b
+          GROQ_MODEL_FALLBACKS: "openai/gpt-oss-20b,openai/gpt-oss-120b"
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
+          REVIEW_RECHECK_MAX_ITEMS: "5"
+          REVIEW_RECHECK_MIN_AGE_DAYS: "7"
+          MODEL_DELAY_SECONDS: "2.5"
+        run: python recheck_crypto_review.py

@@ -4,10 +4,11 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from tracker_common import (
-    MODEL_CHAIN_LABEL, account_freshness, event_key, extract_json, fetch_defillama_protocol_leads, fetch_google_news, fetch_rss_feed,
+    MODEL_CHAIN_LABEL, account_freshness, event_key, excluded_nft_or_meme, extract_json, fetch_defillama_protocol_leads, fetch_google_news, fetch_rss_feed,
     fetch_official_social_links, groq_client, launch_signal_score, parse_event_date, post_rows, published_timestamp, verify_crypto_launch_quality,
     webhook_get, x_recent_search,
 )
+from backfill_crypto import _hard_excluded, build_review_row
 
 STREAM = "crypto"
 MIN_DELAY = float(os.getenv("MODEL_DELAY_SECONDS", "2.5"))
@@ -108,21 +109,32 @@ def main():
     )
 
     client = groq_client()
-    pending, processed = [], []
+    pending, processed, review_pending = [], [], []
     total_saved = total_updated = 0
+    write_failed = False
 
     def flush():
-        nonlocal pending, processed, total_saved, total_updated
-        if not pending and not processed:
-            return
-        result = post_rows(STREAM, pending, processed_sources=processed)
-        if result and result.get("ok"):
-            total_saved += result.get("appended", 0)
-            total_updated += result.get("updated", 0)
-            print(f"  [save] appended={result.get('appended', 0)} updated={result.get('updated', 0)} skipped={result.get('skipped', 0)}")
-            pending, processed = [], []
-        else:
-            print("  [warn] batch not confirmed; keeping pending data for retry")
+        nonlocal pending, processed, review_pending, total_saved, total_updated, write_failed
+        if not pending and not processed and not review_pending:
+            return True
+        for attempt in range(1, 4):
+            result = post_rows(STREAM, pending, processed_sources=processed, review_rows=review_pending)
+            if result and result.get("ok"):
+                total_saved += result.get("appended", 0)
+                total_updated += result.get("updated", 0)
+                print(
+                    f"  [save] main_appended={result.get('appended', 0)} main_updated={result.get('updated', 0)} "
+                    f"review_added={result.get('reviewAppended', 0)} review_updated={result.get('reviewUpdated', 0)} "
+                    f"skipped={result.get('skipped', 0)}"
+                )
+                pending, processed, review_pending = [], [], []
+                write_failed = False
+                return True
+            write_failed = True
+            print(f"  [warn] webhook batch not confirmed (attempt {attempt}/3); keeping buffered data")
+            if attempt < 3:
+                time.sleep(2 ** attempt)
+        return False
 
     for idx, item in enumerate(fresh, 1):
         reported_date = parse_event_date(item)
@@ -158,13 +170,19 @@ def main():
         else:
             passed, vet, evidence_urls = verify_crypto_launch_quality(client, item, data, reported_date)
             if vet.get("quality_gate_reason") == "No successful verification response.":
-                # Do not permanently dedupe a legitimate candidate just because all models
-                # were rate-limited or unavailable. Leave it eligible for the next run.
-                print("  [warn] founder verification could not reach a model; source left unprocessed for retry")
+                # Preserve the lead for later review, but leave the source unprocessed so it
+                # remains eligible for the next live fetch/backfill retry.
+                if not _hard_excluded(data, vet):
+                    review_pending.append(build_review_row(item, data, vet, evidence_urls, reported_date))
+                    print("  [review-queue] retained candidate while verification service is unavailable")
+                print("  [warn] founder verification unavailable; source remains unprocessed for retry")
                 continue
-            processed.append(item["link"])
             if not passed:
                 print(f"  - rejected by strict founder/track-record gate: {vet.get('quality_gate_reason', 'not enough verifiable evidence')}")
+                if not _hard_excluded(data, vet):
+                    review_pending.append(build_review_row(item, data, vet, evidence_urls, reported_date))
+                    print(f"  [review-queue] retained {data.get('project')} separately; main sheet remains strict")
+                processed.append(item["link"])
             else:
                 x_user = item.get("_verified_x_user") or x_user or {}
                 handle = x_user.get("username") or item.get("x_handle", "") or ""
@@ -172,17 +190,20 @@ def main():
                 profile_url = x_user.get("url") or (f"https://x.com/{handle}" if handle else "")
                 tweet_url = item.get("link", "") if item.get("source_type") in {"x", "x_syndication"} else ""
                 age_bucket = account_freshness(account_created)
-                key = event_key(data.get("project"), data.get("launch_date") or vet.get("verified_launch_date") or (reported_date if item.get("source_type") != "defillama_protocol" else "Unknown"), data.get("signal_type", "Other"))
+                verified_launch_date = str(vet.get("verified_launch_date") or "").strip()
+                key_date = verified_launch_date or (reported_date if item.get("source_type") != "defillama_protocol" else "Unknown")
+                key = event_key(data.get("project"), key_date, data.get("signal_type", "Other"))
                 previous_projects = vet.get("previous_web3_projects", [])
                 founders = vet.get("founders", [])
                 if not isinstance(previous_projects, list): previous_projects = [str(previous_projects)] if previous_projects else []
                 if not isinstance(founders, list): founders = [str(founders)] if founders else []
                 official_links = fetch_official_social_links(data.get("website") or "")
+                launch_source = str(vet.get("launch_evidence_url") or item.get("link") or "")
                 row = [
-                    data.get("launch_date") or vet.get("verified_launch_date") or row_date_fallback, data.get("project", ""), data.get("signal_type", "Other"),
-                    data.get("launch_date") or vet.get("verified_launch_date") or row_date_fallback, account_created, f"@{handle}" if handle else "", profile_url,
+                    row_date_fallback, data.get("project", ""), data.get("signal_type", "Other"),
+                    verified_launch_date, account_created, f"@{handle}" if handle else "", profile_url,
                     data.get("website") or "", data.get("broad_offerings", ""), data.get("niche_presence", ""),
-                    data.get("chain_ecosystem") or "", "; ".join(founders), item.get("link", ""), tweet_url,
+                    data.get("chain_ecosystem") or "", "; ".join(founders), launch_source, tweet_url,
                     "Qualified: public founder + prior shipped Web3 work; NFT/meme excluded", vet.get("confidence", data.get("confidence", "Medium")),
                     datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), key, age_bucket,
                     "\n".join(evidence_urls), True, True, "; ".join(previous_projects),
@@ -192,11 +213,15 @@ def main():
                     "; ".join(official_links),
                 ]
                 pending.append(row)
+                review_pending.append(build_review_row(item, data, vet, evidence_urls, reported_date, passed=True))
+                processed.append(item["link"])
                 print(f"  + QUALIFIED {data.get('project')} | {data.get('signal_type')} | founder history verified")
-        if len(pending) >= SAVE_BATCH_SIZE or len(processed) >= SAVE_BATCH_SIZE:
+        if (len(pending) + len(review_pending) >= SAVE_BATCH_SIZE) or len(processed) >= SAVE_BATCH_SIZE:
             flush()
         time.sleep(MIN_DELAY)
     flush()
+    if write_failed:
+        raise RuntimeError("At least one webhook batch remained unconfirmed; candidates will be retried next run.")
     print(f"Completed. Qualified launches appended: {total_saved}; existing events enriched: {total_updated}")
 
 

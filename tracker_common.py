@@ -1419,12 +1419,7 @@ def extract_json(client: Groq, prompt: str, retries: int = 2) -> dict | None:
 
 
 def webhook_get(stream: str, action: str) -> set[str]:
-    """Read dedupe state from Apps Script, failing closed on errors.
-
-    Returning an empty set on an auth/timeout error made a historical scan look like
-    a fresh empty period and could advance the cursor incorrectly. Backfills must
-    not advance unless the remote processed-source registry was read successfully.
-    """
+    """Read dedupe state from Apps Script, failing closed on errors."""
     response = requests.get(
         WEBHOOK_URL,
         params={"token": WEBHOOK_TOKEN, "stream": stream, "action": action},
@@ -1437,31 +1432,62 @@ def webhook_get(stream: str, action: str) -> set[str]:
         raise RuntimeError(f"Webhook returned non-JSON for {action}/{stream}") from exc
     if not data.get("ok"):
         raise RuntimeError(f"Webhook GET {action}/{stream} failed: {data}")
-    key = {"existing_sources": "sources", "existing_keys": "keys", "existing_companies": "companies"}[action]
+    key = {"existing_sources": "sources", "existing_keys": "keys", "existing_companies": "companies"}.get(action)
+    if not key:
+        raise ValueError(f"Unsupported set-valued webhook action: {action}")
     values = data.get(key)
     if not isinstance(values, list):
         raise RuntimeError(f"Webhook response missing '{key}' for {action}/{stream}")
     return set(str(x) for x in values if x)
 
 
+def webhook_get_review_queue() -> list[list[Any]]:
+    """Read the visible Crypto Review Queue; errors must not look like an empty queue."""
+    response = requests.get(
+        WEBHOOK_URL,
+        params={"token": WEBHOOK_TOKEN, "stream": "crypto", "action": "review_queue"},
+        timeout=45,
+    )
+    response.raise_for_status()
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError("Webhook returned non-JSON for review_queue/crypto") from exc
+    if not data.get("ok") or not isinstance(data.get("rows"), list):
+        raise RuntimeError(f"Webhook GET review_queue/crypto failed: {data}")
+    return data["rows"]
+
+
 def post_rows(
     stream: str, rows: list[list[Any]], processed_sources: list[str] | None = None, *,
-    allow_reprocessed_sources: bool = False,
+    allow_reprocessed_sources: bool = False, review_rows: list[list[Any]] | None = None,
 ) -> dict | None:
-    if not rows and not processed_sources:
-        return {"ok": True, "appended": 0, "skipped": 0}
+    review_rows = review_rows or []
+    if not rows and not processed_sources and not review_rows:
+        return {"ok": True, "appended": 0, "updated": 0, "reviewAppended": 0, "reviewUpdated": 0, "skipped": 0}
     try:
         response = requests.post(
             WEBHOOK_URL,
             json={"token": WEBHOOK_TOKEN, "stream": stream, "rows": rows,
+                  "reviewRows": review_rows,
                   "processedSources": processed_sources or [],
                   "allowReprocessedSources": bool(allow_reprocessed_sources)},
             timeout=60,
         )
         response.raise_for_status()
-        return response.json()
+        try:
+            data = response.json()
+        except ValueError as exc:
+            print(f"[error] webhook POST returned non-JSON (HTTP {response.status_code}): {response.text[:500]!r}")
+            return None
+        if not isinstance(data, dict) or not data.get("ok"):
+            print(f"[error] webhook POST rejected payload (HTTP {response.status_code}): {str(data)[:700]}")
+            return None
+        return data
     except Exception as exc:
-        print(f"[error] webhook POST failed for {stream}: {exc}")
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        body = getattr(getattr(exc, "response", None), "text", "")
+        print(f"[error] webhook POST failed for {stream} (HTTP {status or 'n/a'}): {exc}; response={str(body)[:500]!r}")
         return None
 
 

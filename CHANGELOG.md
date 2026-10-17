@@ -41,3 +41,12 @@
 - Enforce account balance floor of 200 credits, tracker cap 800 credits/month, and 24 credits/day; detail records cost 2 credits and search/quota endpoints are used per official docs.
 - Use only Basic-safe project description, tags, establishment date, RootData URL, and available social/site links; never request/include teams, investor, or funding-round data.
 - Persist the cache/budget file through both crypto workflows; stagger live monitoring to minute 55 UTC to avoid concurrent state updates with backfill at minute 40 UTC.
+
+## v14 — Crypto Review Queue and review retries
+
+- Added a visible `Crypto Review Queue` for plausible candidates that fail the strict founder/track-record or independent-launch-evidence check. NFT/meme-first projects remain excluded.
+- Added idempotent queue upserts keyed by project/source date/signal, preserving first-seen timestamps and user-entered manual decisions/notes.
+- Extended the Apps Script POST contract with `reviewRows`; processed-source URLs are recorded only after main-sheet and review-queue writes succeed.
+- Improved webhook failure diagnostics and buffering/retry behavior for live and historical crypto ingestion. The historical cursor remains pending if any unresolved model/search/write item remains.
+- Added daily review rechecks for unresolved candidates last checked at least seven days ago. Qualified records are promoted into `Crypto Launch Radar`; the review row is marked promoted. The recheck job does not receive the RootData API key, so it doesn't spend RootData detail credits.
+- Main-sheet launch dates are now written only when the independent evidence review verified an explicit date; DeFiLlama `listedAt` remains a discovery timestamp only.
