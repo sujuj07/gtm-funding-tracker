@@ -11,6 +11,11 @@ on:
         required: false
         default: false
         type: boolean
+      recheck_processed_sources:
+        description: "One-time re-evaluation of previously processed crypto launch sources (use with reset_cursor)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -51,6 +56,7 @@ jobs:
           BACKFILL_DATE_FROM: "2026-08-01"
           BACKFILL_WINDOW_DAYS: "7"
           BACKFILL_MAX_ITEMS_PER_RUN: ${{ github.event_name == 'schedule' && '6' || '8' }}
+          BACKFILL_RECHECK_PROCESSED_SOURCES: ${{ github.event_name == 'workflow_dispatch' && inputs.recheck_processed_sources && 'true' || 'false' }}
         run: python backfill_crypto.py
       - name: Persist cursor on the default branch
         if: ${{ always() && (success() || (github.event_name == 'workflow_dispatch' && inputs.reset_cursor)) }}

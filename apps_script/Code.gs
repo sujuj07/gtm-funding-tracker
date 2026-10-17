@@ -290,6 +290,9 @@ function doPost(e) {
     const sheet = getSheetForStream(stream);
     const existingSources = {};
     getExistingSources(stream, sheet).forEach(function (url) { existingSources[url] = true; });
+    // Allow a one-time, authenticated crypto backfill recheck to re-evaluate earlier sources.
+    // Existing event keys/natural keys still route matching rows to merge/update instead of duplicating them.
+    const allowReprocessedSources = stream === 'crypto' && body.allowReprocessedSources === true;
     const keyRows = getKeyRowMap(stream, sheet);
     const naturalRows = getNaturalEventRowMap(stream, sheet);
     const rows = Array.isArray(body.rows) ? body.rows : [];
@@ -304,7 +307,7 @@ function doPost(e) {
       const company = String(row[config.companyCol - 1] || '').trim();
       const source = String(row[config.sourceCol - 1] || '').trim();
       const key = String(row[config.keyCol - 1] || '').trim();
-      if (!company || !source || !key || existingSources[source] || batchSources[source] || batchKeys[key]) {
+      if (!company || !source || !key || (existingSources[source] && !allowReprocessedSources) || batchSources[source] || batchKeys[key]) {
         skipped++;
         return;
       }

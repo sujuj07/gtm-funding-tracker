@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import hashlib
+import html
+import ipaddress
 import json
 from email.utils import parsedate_to_datetime
 import os
 import re
 import time
 import urllib.parse
+from html.parser import HTMLParser
 from datetime import datetime, timezone
 from typing import Any
 
@@ -296,8 +299,134 @@ def excluded_nft_or_meme(data: dict[str, Any]) -> bool:
     ))
 
 
+class _ResearchPageParser(HTMLParser):
+    """Small stdlib-only parser for evidence snippets and navigational links."""
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title_parts: list[str] = []
+        self.text_parts: list[str] = []
+        self.links: list[tuple[str, str]] = []
+        self._in_title = False
+        self._skip_depth = 0
+        self._anchor_href = ""
+        self._anchor_parts: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        low = tag.lower()
+        if low in {"script", "style", "noscript", "svg", "iframe"}:
+            self._skip_depth += 1
+            return
+        if low == "title":
+            self._in_title = True
+        if low == "a":
+            self._anchor_href = str(attrs.get("href") or "")
+            self._anchor_parts = []
+        if low in {"br", "p", "div", "li", "h1", "h2", "h3", "section", "article"}:
+            self.text_parts.append(" ")
+
+    def handle_endtag(self, tag):
+        low = tag.lower()
+        if low in {"script", "style", "noscript", "svg", "iframe"} and self._skip_depth:
+            self._skip_depth -= 1
+            return
+        if low == "title":
+            self._in_title = False
+        if low == "a" and self._anchor_href:
+            label = " ".join(self._anchor_parts).strip()
+            self.links.append((self._anchor_href, label))
+            self._anchor_href = ""
+            self._anchor_parts = []
+        if low in {"br", "p", "div", "li", "h1", "h2", "h3", "section", "article"}:
+            self.text_parts.append(" ")
+
+    def handle_data(self, data):
+        if self._skip_depth:
+            return
+        value = re.sub(r"\s+", " ", data or " ").strip()
+        if not value:
+            return
+        if self._in_title:
+            self.title_parts.append(value)
+        self.text_parts.append(value)
+        if self._anchor_href:
+            self._anchor_parts.append(value)
+
+
+def _safe_public_http_url(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(str(url or "").strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            return False
+        host = parsed.hostname.lower().strip(".")
+        if host in {"localhost", "localhost.localdomain"} or host.endswith((".local", ".internal", ".localhost")):
+            return False
+        try:
+            address = ipaddress.ip_address(host)
+            if not address.is_global:
+                return False
+        except ValueError:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+def fetch_research_page(url: str, *, source_label: str = "Web page", max_chars: int = 1800) -> dict[str, Any] | None:
+    """Fetch a public HTML page for evidence; never trusts model text as a fact without a URL."""
+    if not _safe_public_http_url(url):
+        return None
+    try:
+        response = requests.get(
+            url, timeout=(4, 8), allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; StartupIntelligenceTracker/1.0)"},
+        )
+        response.raise_for_status()
+        if not _safe_public_http_url(response.url):
+            return None
+        content_type = str(response.headers.get("Content-Type", "")).lower()
+        if content_type and not any(x in content_type for x in ("text/html", "application/xhtml+xml", "text/plain")):
+            return None
+        parser = _ResearchPageParser()
+        # Keep extraction bounded to avoid large downloads/token explosions.
+        parser.feed(response.text[:900_000])
+        title = re.sub(r"\s+", " ", " ".join(parser.title_parts)).strip()[:300]
+        body = re.sub(r"\s+", " ", html.unescape(" ".join(parser.text_parts))).strip()[:max_chars]
+        links = [(urllib.parse.urljoin(response.url, href), label[:160]) for href, label in parser.links if href]
+        if not title and not body:
+            return None
+        return {"title": title or source_label, "publisher": source_label, "url": response.url,
+                "body": body, "links": links}
+    except Exception as exc:
+        print(f"  [verify] page fetch unavailable ({source_label}): {type(exc).__name__}")
+        return None
+
+
+def _verification_queries(project: str, candidate: dict[str, Any], item: dict[str, Any], website_host: str = "") -> list[str]:
+    title = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()[:140]
+    queries = [
+        f'"{project}" founders team Web3',
+        f'"{project}" founder previous project crypto protocol',
+        f'"{project}" founder mainnet launch team',
+    ]
+    # Short or ambiguous names such as "Arc" need the launch headline context to
+    # avoid searching an unrelated product with the same name.
+    if title:
+        queries.append(f'"{project}" {title} founder team blockchain')
+    if website_host:
+        queries.append(f'site:{website_host} founder OR team OR about OR leadership')
+    for founder in _as_name_list(candidate.get("founders"))[:2]:
+        queries.extend([f'"{founder}" built Web3 protocol', f'"{founder}" previous crypto project founder'])
+    unique = []
+    for query in queries:
+        query = re.sub(r"\s+", " ", query).strip()
+        if query and query not in unique:
+            unique.append(query)
+    return unique[:6]
+
+
 def verify_crypto_launch_quality(client: Groq, item: dict[str, Any], candidate: dict[str, Any], event_date: str) -> tuple[bool, dict[str, Any], list[str]]:
-    """Require sourced launch, public founder identity and prior shipped Web3 work."""
+    """Require evidence of a real launch, publicly named founder, and prior shipped Web3 work."""
     project = str(candidate.get("project") or "").strip()
     category = str(candidate.get("project_category") or "").strip()
     if not project or excluded_nft_or_meme(candidate):
@@ -305,27 +434,121 @@ def verify_crypto_launch_quality(client: Groq, item: dict[str, Any], candidate: 
                        "quality_gate_reason": "Rejected by NFT/meme or missing-project hard filter."}, []
 
     raw_names = _as_name_list(candidate.get("founders"))
-    queries = [f'"{project}" founders team crypto web3', f'"{project}" founder co-founder blockchain protocol']
-    for founder in raw_names[:2]:
-        queries.extend([f'"{founder}" built web3 protocol founder', f'"{founder}" crypto founder previous project'])
+    evidence: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
 
-    evidence: list[dict[str, str]] = [{
-        "title": str(item.get("title", ""))[:350], "publisher": str(item.get("publisher", "Unknown")),
-        "url": str(item.get("link", "")), "body": str(item.get("body", ""))[:1000],
-    }]
-    seen_urls = {e["url"] for e in evidence if e.get("url")}
-    for query in queries:
-        for result in fetch_google_news(query, limit=5):
-            url = str(result.get("link", "")).strip()
-            if not url or url in seen_urls:
+    def add_evidence(record: dict[str, Any] | None, fallback_url: str = "", fallback_title: str = ""):
+        if record is None:
+            return
+        url = str(record.get("url") or fallback_url or "").strip()
+        if not url or url in seen_urls:
+            return
+        seen_urls.add(url)
+        evidence.append({
+            "title": str(record.get("title") or fallback_title or "Web source")[:300],
+            "publisher": str(record.get("publisher") or "Unknown")[:100],
+            "url": url,
+            "body": str(record.get("body") or "")[:1400],
+        })
+
+    # Fetch the article behind the RSS result itself: feeds often truncate the
+    # founder and prior-product context needed for a strict verification pass.
+    add_evidence({"title": item.get("title", ""), "publisher": item.get("publisher", "Unknown"),
+                  "url": item.get("link", ""), "body": item.get("body", "")[:1200]})
+    article_page = fetch_research_page(str(item.get("link") or ""), source_label=str(item.get("publisher") or "Launch source"), max_chars=2200)
+    add_evidence(article_page)
+
+    website = str(candidate.get("website") or "").strip()
+    if website and not re.match(r"^https?://", website, re.I):
+        website = "https://" + website
+    website_page = fetch_research_page(website, source_label="Official project website", max_chars=2100) if website else None
+    add_evidence(website_page)
+
+    # Follow only public, same-site people/about/founder links found on the real homepage.
+    website_host = ""
+    if website_page:
+        parsed_website = urllib.parse.urlparse(str(website_page.get("url") or website))
+        website_host = (parsed_website.hostname or "").lower().removeprefix("www.")
+        selected_links = []
+        for url, label in website_page.get("links", []):
+            full = urllib.parse.urlparse(url)
+            host = (full.hostname or "").lower().removeprefix("www.")
+            searchable = f"{full.path} {label}".lower()
+            if host != website_host:
                 continue
-            seen_urls.add(url)
-            evidence.append({"title": str(result.get("title", ""))[:350],
-                             "publisher": str(result.get("publisher", "Unknown")), "url": url,
-                             "body": str(result.get("body", ""))[:1000]})
-        time.sleep(0.15)
+            if re.search(r"\b(about|team|founder|leadership|company|people|our-story|who-we-are|contributors|core-team)\b", searchable):
+                if url not in [x[0] for x in selected_links]:
+                    selected_links.append((url, label or full.path))
+            if len(selected_links) >= 3:
+                break
+        for url, label in selected_links:
+            add_evidence(fetch_research_page(url, source_label=f"Official website: {label}", max_chars=1800))
 
-    prompt = r"""You are a conservative due-diligence reviewer for a crypto/Web3 launch radar. Return JSON only:
+    queries = _verification_queries(project, candidate, item, website_host)
+    query_result_count = 0
+    for query in queries:
+        try:
+            results = fetch_google_news(query, limit=4)
+        except Exception as exc:
+            print(f"  [verify] search unavailable for {query[:85]!r}: {type(exc).__name__}")
+            results = []
+        query_result_count += len(results)
+        for result in results:
+            add_evidence(result)
+        print(f"  [verify] query returned {len(results)} result(s): {query[:100]}")
+        time.sleep(0.12)
+
+    evidence = evidence[:14]
+    discovered_founders = raw_names[:]
+    if not discovered_founders and evidence:
+        founder_discovery_prompt = r"""Extract only explicitly named founders or co-founders of the specific project from the supplied source materials. Do not use prior model knowledge. Do not treat a CEO, investor, advisor, executive or parent-company founder as the new project's founder unless a source explicitly says they founded this specific project. Return JSON only:
+{"founders": [{"name": "Full Name", "role": "Founder|Co-founder", "evidence_url": "exact URL from supplied sources"}]}
+If no source explicitly connects a named person to founding this project, return {"founders": []}. Evidence URLs must match one of the supplied URLs exactly.
+
+PROJECT: """ + json.dumps(project, ensure_ascii=False) + r"""
+LAUNCH TITLE: """ + json.dumps(str(item.get("title") or ""), ensure_ascii=False) + r"""
+SOURCES: """ + json.dumps(evidence[:10], ensure_ascii=False) + "\n"
+        discovery = extract_json(client, founder_discovery_prompt)
+        allowed_before_followup = {e["url"] for e in evidence if e.get("url")}
+        discovered = []
+        if isinstance(discovery, dict) and isinstance(discovery.get("founders"), list):
+            for person in discovery["founders"][:3]:
+                if not isinstance(person, dict):
+                    continue
+                name = str(person.get("name") or "").strip()
+                role = str(person.get("role") or "").lower()
+                ev_url = str(person.get("evidence_url") or "").strip()
+                if name and re.search(r"founder|co.?founder", role) and ev_url in allowed_before_followup and name not in discovered:
+                    discovered.append(name)
+        if discovered:
+            discovered_founders = discovered
+            print(f"  [verify] extracted publicly named founder(s) from sources: {', '.join(discovered_founders)}; checking prior build history")
+            followup_queries = []
+            for founder in discovered_founders[:2]:
+                followup_queries.extend([
+                    f'"{founder}" built Web3 protocol product',
+                    f'"{founder}" previous crypto project founder blockchain',
+                ])
+            for query in followup_queries:
+                try:
+                    results = fetch_google_news(query, limit=4)
+                except Exception as exc:
+                    print(f"  [verify] founder-history search unavailable: {type(exc).__name__}")
+                    results = []
+                query_result_count += len(results)
+                for result in results:
+                    add_evidence(result)
+                print(f"  [verify] founder-history query returned {len(results)} result(s): {query[:100]}")
+                time.sleep(0.12)
+    evidence = evidence[:20]
+    verification_candidate = dict(candidate)
+    if discovered_founders:
+        verification_candidate["founders"] = discovered_founders
+    print(f"  [verify] evidence pool={len(evidence)} unique sources; web-search items={query_result_count}; official website={'yes' if website_page else 'no'}")
+    for src in evidence[:10]:
+        print(f"  [verify-source] {src['publisher']}: {src['title'][:95]} | {src['url'][:150]}")
+
+    prompt = r"""You are a conservative due-diligence reviewer for a selective crypto/Web3 launch radar. Return JSON only:
 {
  "quality_gate_pass": false,
  "launch_verified": false,
@@ -341,15 +564,15 @@ def verify_crypto_launch_quality(client: Groq, item: dict[str, Any], candidate: 
  "confidence": "High|Medium|Low",
  "quality_gate_reason": "brief factual reason"
 }
-PASS ONLY if all are evidenced: (1) the original source explicitly announces a substantive new product/protocol/mainnet/testnet/developer infrastructure/wallet/security/DeFi/payments launch; (2) the project is NOT primarily NFT/PFP/collectibles or a meme coin/token and is not a token-only launch without substantive product utility; (3) at least one founder is publicly identified by name in a supplied source; (4) at least one named founder previously built/shipped a real Web3 product/protocol or founded a Web3 company with a product. Merely working in crypto, advising, investing, marketing, influencing, running a community or making an unshipped announcement does not qualify as builder history. Do not infer identity from a pseudonymous X handle or use general model memory as evidence. Do not invent names, roles, projects or URLs. Evidence URLs must exactly match URLs supplied below. If evidence is insufficient or ambiguous, fail closed. Prefer credible publications, official team/about pages or prior-project sources.
+PASS ONLY if all are evidenced: (1) the source explicitly announces a substantive new product/protocol/mainnet/testnet/developer infrastructure/wallet/security/DeFi/payments launch; (2) the project is NOT primarily NFT/PFP/collectibles or a meme coin/token and is not a token-only launch without substantive product utility; (3) at least one project founder or explicitly identified founding team member is publicly named in supplied source material; (4) at least one named founder previously built/shipped a real Web3 product/protocol or founded a Web3 company with a product. Merely working in crypto, advising, investing, marketing, influencing, running a community or making an unshipped announcement does not qualify. Do not infer identity from a pseudonymous X handle. Do not use model memory as evidence. Do not invent names, roles, projects or URLs. Every evidence URL must exactly match a URL in the supplied source list. If any criterion lacks evidence, fail closed and explain which evidence is missing. Prefer credible media, official team/about pages, project documentation, GitHub organizations or verifiable prior-project sources.
 
 INITIAL CANDIDATE:
-""" + json.dumps(candidate, ensure_ascii=False) + r"""
+""" + json.dumps(verification_candidate, ensure_ascii=False) + r"""
 
 LAUNCH SOURCE:
 """ + json.dumps({"date": event_date, "title": item.get("title", ""), "publisher": item.get("publisher", ""), "url": item.get("link", ""), "body": item.get("body", "")[:1200]}, ensure_ascii=False) + r"""
 
-PROJECT / FOUNDER SEARCH RESULTS:
+PROJECT / FOUNDER SEARCH RESULTS AND OFFICIAL WEB PAGES:
 """ + json.dumps(evidence, ensure_ascii=False) + "\n"
 
     verified = extract_json(client, prompt)
@@ -559,14 +782,18 @@ def webhook_get(stream: str, action: str) -> set[str]:
     return set(str(x) for x in values if x)
 
 
-def post_rows(stream: str, rows: list[list[Any]], processed_sources: list[str] | None = None) -> dict | None:
+def post_rows(
+    stream: str, rows: list[list[Any]], processed_sources: list[str] | None = None, *,
+    allow_reprocessed_sources: bool = False,
+) -> dict | None:
     if not rows and not processed_sources:
         return {"ok": True, "appended": 0, "skipped": 0}
     try:
         response = requests.post(
             WEBHOOK_URL,
             json={"token": WEBHOOK_TOKEN, "stream": stream, "rows": rows,
-                  "processedSources": processed_sources or []},
+                  "processedSources": processed_sources or [],
+                  "allowReprocessedSources": bool(allow_reprocessed_sources)},
             timeout=60,
         )
         response.raise_for_status()

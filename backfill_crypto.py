@@ -16,6 +16,7 @@ DATE_TO = os.getenv("BACKFILL_DATE_TO", end_exclusive_today())
 WINDOW_DAYS = int(os.getenv("BACKFILL_WINDOW_DAYS", "7"))
 ITEMS_PER_QUERY = int(os.getenv("BACKFILL_ITEMS_PER_QUERY", "60"))
 MAX_ITEMS_PER_RUN = int(os.getenv("BACKFILL_MAX_ITEMS_PER_RUN", "60"))
+RECHECK_PROCESSED_SOURCES = os.getenv("BACKFILL_RECHECK_PROCESSED_SOURCES", "false").strip().lower() in {"1", "true", "yes", "on"}
 SAVE_BATCH_SIZE = int(os.getenv("SAVE_BATCH_SIZE", "10"))
 DELAY = float(os.getenv("MODEL_DELAY_SECONDS", "2.5"))
 QUERIES = [
@@ -121,7 +122,11 @@ def main():
     print(f"Crypto launch historical backfill | strict-founder-gate=on | {window_start} <= dates < {window_end} | current target end={DATE_TO} | model-route={MODEL_CHAIN_LABEL}")
     all_items, search_incomplete = collect(window_start, window_end)
     existing_sources = webhook_get(STREAM, "existing_sources")
-    raw_fresh = [x for x in all_items if x.get("link") and x["link"] not in existing_sources]
+    # A one-time manual recheck can bypass the remote processed registry after verification logic improves.
+    # POST also receives allowReprocessedSources, while event keys/source dedupe still prevent duplicate rows.
+    raw_fresh = [x for x in all_items if x.get("link") and (RECHECK_PROCESSED_SOURCES or x["link"] not in existing_sources)]
+    if RECHECK_PROCESSED_SOURCES:
+        print("  [recheck] re-evaluating sources already in the processed registry for this date window")
     # Avoid wasting model quota triaging generic crypto news. Only articles with
     # a visible product/network launch cue proceed to LLM classification.
     fresh_all = [x for x in raw_fresh if launch_signal_score(x) > 0]
@@ -147,7 +152,7 @@ def main():
         nonlocal pending, processed, appended, updated, flush_unconfirmed
         if not pending and not processed:
             return
-        result = post_rows(STREAM, pending, processed_sources=processed)
+        result = post_rows(STREAM, pending, processed_sources=processed, allow_reprocessed_sources=RECHECK_PROCESSED_SOURCES)
         if result and result.get("ok"):
             appended += result.get("appended", 0)
             updated += result.get("updated", 0)
