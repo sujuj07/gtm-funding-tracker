@@ -1,3 +1,11 @@
+## v5 — Automated historical catch-up
+
+- Added daily schedules for funding and crypto historical backfills.
+- Scheduled runs use conservative caps (20 funding candidates/day; 10 crypto candidates/day) to manage free-tier model usage.
+- Manual workflow dispatch remains available and permits up to 60 candidates per run.
+- Backfill end date remains dynamic, so the current UTC date is included automatically.
+- Documented that full global coverage is limited by indexed source availability.
+
 # Changelog
 
 ## v2 — October 2026

@@ -1,12 +1,18 @@
 name: backfill-funding-intelligence
 
 on:
+  # Daily catch-up; each run uses the current date as the exclusive end date.
+  schedule:
+    - cron: "5 0 * * *"
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    concurrency:
+      group: startup-intelligence-funding-backfill
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,5 +29,5 @@ jobs:
           WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
           DEFILLAMA_API_KEY: ${{ secrets.DEFILLAMA_API_KEY }}
           BACKFILL_DATE_FROM: "2026-08-01"
-          BACKFILL_MAX_ITEMS_PER_RUN: "60"
+          BACKFILL_MAX_ITEMS_PER_RUN: ${{ github.event_name == 'schedule' && '20' || '60' }}
         run: python backfill.py

@@ -5,7 +5,7 @@ Two Google Sheets data streams powered by Python, Groq, GitHub Actions, and a Go
 1. **Funding Intelligence** — global AI, deep-tech, crypto/Web3 and fintech funding rounds, explicit company formation/incorporation signals, and reported hiring/expansion signals.
 2. **Crypto Launch Radar** — a selective list of substantive crypto/Web3 launches. NFT/PFP/collectibles-first and meme/memecoin projects are excluded; every tracked launch must have at least one publicly named founder with evidence of a previous shipped Web3 product/protocol or Web3 company-building track record.
 
-The historical backfill defaults to **1 August 2026 through the current UTC date**. Scheduled collection runs hourly; GitHub Actions timing is best-effort, not guaranteed real-time.
+The historical backfill defaults to **1 August 2026 through the current UTC date**. Live collection runs hourly and historical catch-up runs daily. GitHub Actions timing is best-effort, not guaranteed real-time.
 
 ## Data coverage and limitations
 
@@ -65,17 +65,15 @@ Optional repository variable:
 
 The hourly workflows are deliberately capped at four funding candidates and two crypto-launch candidates per hourly run to help stay within the 200k tokens/day and 1k requests/day model limits shown in the supplied Groq console screenshot. Crypto candidates that pass first-stage launch triage undergo a second model review plus multiple Google News evidence searches, so accepted candidates consume more tokens/requests than rejected ones. If usage is comfortably below quota, increase `MAX_ITEMS_PER_RUN` / `CRYPTO_MAX_ITEMS_PER_RUN`; increasing them increases coverage and token use. The new strict gate applies to new rows; it does not automatically delete or retroactively vet crypto entries already present in the sheet.
 
-## 4. Run the initial historical backfill
+## 4. Automated historical backfill and catch-up
 
 After the webhook is deployed and GitHub secrets are set:
 
-1. Open the repository's **Actions** tab.
-2. Run **backfill-funding-intelligence** manually.
-3. Run **backfill-crypto-launch-radar** manually.
-4. Re-run each workflow while it continues to discover unprocessed indexed results. Each run processes up to 60 candidates by default. They may take several runs to exhaust the search results within the free model quota.
-5. The scheduled hourly workflows continue collecting new signals independently.
+1. Run **backfill-funding-intelligence** and **backfill-crypto-launch-radar** manually once from the Actions tab to begin the historical collection immediately. Manual runs process up to 60 candidates per run.
+2. Both workflows also run automatically every day. Scheduled runs process up to 20 funding candidates and 10 crypto-launch candidates per day, using the same processed-source registry to skip sources already inspected. Repeated runs continue through indexed historical results; the hourly workflows independently capture newly surfaced current signals.
+3. Check each run in GitHub Actions. If a job fails due to rate limits or a timeout, use **Run workflow** to retry manually.
 
-Date range is controlled by `BACKFILL_DATE_FROM` and `BACKFILL_DATE_TO`. Defaults are `2026-08-01` and tomorrow's date (exclusive), meaning today is included. For a fresh replay, clear the hidden processed-source registry only after backing it up; otherwise the webhook correctly skips previously processed sources.
+Date range is controlled by `BACKFILL_DATE_FROM` and `BACKFILL_DATE_TO`. Defaults are `2026-08-01` and tomorrow's UTC date (exclusive), so today is included. The scheduled daily backfills keep this end date moving forward automatically. Search feeds have finite and changing coverage, so this cannot guarantee every company or launch since August is found. For a fresh replay, clear the hidden processed-source registry only after backing it up; otherwise the webhook correctly skips previously processed sources.
 
 ## 5. Columns
 
@@ -100,4 +98,4 @@ python backfill.py
 python backfill_crypto.py
 ```
 
-The two backfill scripts are historical search jobs and should be run manually. Scheduled collection is managed by `.github/workflows/fetch.yml` and `.github/workflows/fetch-crypto.yml`.
+The two backfill scripts can be run manually and are also scheduled daily by `.github/workflows/backfill.yml` and `.github/workflows/backfill-crypto.yml`. Hourly collection is managed by `.github/workflows/fetch.yml` and `.github/workflows/fetch-crypto.yml`.
