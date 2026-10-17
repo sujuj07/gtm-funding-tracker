@@ -23,3 +23,21 @@
 - Added best-effort public X profile timeline enrichment through the unauthenticated syndication page for handles identified from official/project sources. This unofficial endpoint covers recent posts on known profiles only; it is not keyword search or a full archive.
 - Verification now asks more directly for independent launch evidence and can use official-site-linked X posts as supporting evidence.
 - DeFiLlama `listedAt` is never copied into the sheet as a launch/announcement date.
+
+## v12 — Backfill recheck cap and evidence enrichment
+- Fixed the manual `recheck_processed_sources` run cap: when enabled, up to 60 candidates can be evaluated in that run, so the same historical week is not left pending simply because the recheck batch was capped at 8.
+- Scheduled backfill cadence and per-run caps remain unchanged (hourly, 6 candidates/run).
+- Crypto founder verification probes a limited number of official same-site about/team and blog/news/launch pages and follows up to two official launch links.
+- Public GitHub metadata is fetched only for links found on official project pages and remains supplementary evidence, not standalone proof of founder identity.
+- Added a concrete Apps Script formatting application step for the Crypto Launch Radar tab.
+- Added a code-level guard requiring the selected independent launch evidence page itself to contain an explicit launch cue and Web3 context; registry listings and generic homepages no longer pass as launch evidence based solely on model output.
+- Added a `Tracker Tools → Format Crypto Launch Radar` menu to apply sheet styling visibly on demand.
+
+
+## v13 — RootData Basic, credit-capped enrichment
+- Add optional RootData project search and Basic project metadata enrichment for shortlisted launch candidates.
+- Enforce name-match confidence; never match ambiguous short names or treat registry metadata as launch/founder proof.
+- Cache search/detail responses across workflow runs.
+- Enforce account balance floor of 200 credits, tracker cap 800 credits/month, and 24 credits/day; detail records cost 2 credits and search/quota endpoints are used per official docs.
+- Use only Basic-safe project description, tags, establishment date, RootData URL, and available social/site links; never request/include teams, investor, or funding-round data.
+- Persist the cache/budget file through both crypto workflows; stagger live monitoring to minute 55 UTC to avoid concurrent state updates with backfill at minute 40 UTC.

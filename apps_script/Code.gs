@@ -8,6 +8,20 @@ const FUNDING_SHEET_NAME = 'Funding Intelligence';
 const CRYPTO_SHEET_NAME = 'Crypto Launch Radar';
 const REGISTRY_SHEET_NAME = '__ProcessedSources';
 
+// Adds a simple in-sheet action so styling can be applied without constructing a URL.
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Tracker Tools')
+    .addItem('Format Crypto Launch Radar', 'formatCryptoLaunchRadar')
+    .addToUi();
+}
+
+function formatCryptoLaunchRadar() {
+  const sheet = getSheetForStream('crypto');
+  formatTrackerSheet(sheet, 'crypto');
+  SpreadsheetApp.getActiveSpreadsheet().toast('Crypto Launch Radar formatting applied.', 'Tracker Tools', 5);
+}
+
 const STREAMS = {
   funding: { sheetName: FUNDING_SHEET_NAME, companyCol: 2, sourceCol: 16, keyCol: 19, additionalSourcesCol: 31, lastCheckedCol: 29, maxCol: 31 },
   crypto: { sheetName: CRYPTO_SHEET_NAME, companyCol: 2, sourceCol: 13, keyCol: 18, additionalSourcesCol: 20, lastCheckedCol: 17, maxCol: 28 },

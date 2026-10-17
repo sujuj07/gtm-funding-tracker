@@ -26,7 +26,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     concurrency:
-      group: startup-intelligence-crypto-backfill
+      group: startup-intelligence-rootdata-state
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
@@ -45,6 +45,10 @@ jobs:
           cache: "pip"
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Check RootData Basic API and credit guard (no project-detail credits)
+        env:
+          ROOTDATA_API_KEY: ${{ secrets.ROOTDATA_API_KEY }}
+        run: python rootdata_check.py
       - name: Process the next crypto-launch history window
         id: backfill
         env:
@@ -53,9 +57,13 @@ jobs:
           GROQ_MODEL_FALLBACKS: "openai/gpt-oss-20b,openai/gpt-oss-120b"
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
+          ROOTDATA_API_KEY: ${{ secrets.ROOTDATA_API_KEY }}
+          ROOTDATA_MONTHLY_CREDIT_CAP: "800"
+          ROOTDATA_DAILY_CREDIT_CAP: "24"
+          ROOTDATA_RESERVE_CREDITS: "200"
           BACKFILL_DATE_FROM: "2026-08-01"
           BACKFILL_WINDOW_DAYS: "7"
-          BACKFILL_MAX_ITEMS_PER_RUN: ${{ github.event_name == 'schedule' && '6' || '8' }}
+          BACKFILL_MAX_ITEMS_PER_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.recheck_processed_sources && '60' || (github.event_name == 'schedule' && '6' || '8') }}
           BACKFILL_RECHECK_PROCESSED_SOURCES: ${{ github.event_name == 'workflow_dispatch' && inputs.recheck_processed_sources && 'true' || 'false' }}
         run: python backfill_crypto.py
       - name: Persist cursor on the default branch

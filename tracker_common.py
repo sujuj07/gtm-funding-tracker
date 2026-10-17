@@ -5,6 +5,7 @@ import hashlib
 import html
 import ipaddress
 import json
+import difflib
 from email.utils import parsedate_to_datetime
 import os
 import re
@@ -12,6 +13,7 @@ import time
 import urllib.parse
 from html.parser import HTMLParser
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import feedparser
@@ -34,6 +36,14 @@ WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 WEBHOOK_TOKEN = os.environ["WEBHOOK_TOKEN"]
 X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "").strip()
 DEFILLAMA_API_KEY = os.getenv("DEFILLAMA_API_KEY", "").strip()
+ROOTDATA_API_KEY = os.getenv("ROOTDATA_API_KEY", "").strip()
+# RootData Basic plan: /open/ser_inv is documented as unlimited search; /open/get_item costs 2 credits.
+# Keep a 200-credit account reserve, cap our own use at 800 credits/month and 24 credits/day.
+ROOTDATA_MONTHLY_CREDIT_CAP = int(os.getenv("ROOTDATA_MONTHLY_CREDIT_CAP", "800"))
+ROOTDATA_DAILY_CREDIT_CAP = int(os.getenv("ROOTDATA_DAILY_CREDIT_CAP", "24"))
+ROOTDATA_RESERVE_CREDITS = int(os.getenv("ROOTDATA_RESERVE_CREDITS", "200"))
+ROOTDATA_STATE_PATH = Path(os.getenv("ROOTDATA_STATE_PATH", ".backfill-state/rootdata-state.json"))
+ROOTDATA_DETAIL_CREDIT_COST = 2
 
 
 def strip_html(value: str) -> str:
@@ -358,6 +368,275 @@ def fetch_defillama_protocol_leads(after: str, before: str) -> list[dict]:
     return records
 
 
+
+# RootData Basic integration. Project/VC/person search is documented as unlimited
+# (subject to 60 req/min); project details cost 2 credits/call. We only request
+# project details with include_team/include_investors omitted, and we intentionally
+# ignore funding and investor fields because the user's Basic plan does not include them.
+def _rootdata_load_state() -> dict[str, Any]:
+    try:
+        raw = ROOTDATA_STATE_PATH.read_text(encoding="utf-8")
+        value = json.loads(raw)
+        return value if isinstance(value, dict) else {}
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return {}
+
+
+def _rootdata_save_state(state: dict[str, Any]) -> None:
+    try:
+        ROOTDATA_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = ROOTDATA_STATE_PATH.with_suffix(ROOTDATA_STATE_PATH.suffix + ".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        tmp.replace(ROOTDATA_STATE_PATH)
+    except OSError as exc:
+        # The API quota endpoint remains a hard safety gate even if the local ledger can't persist.
+        print(f"  [rootdata] local cache/usage ledger could not be saved: {type(exc).__name__}")
+
+
+def _rootdata_current_period(state: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    now = datetime.now(timezone.utc)
+    month = now.strftime("%Y-%m")
+    day = now.strftime("%Y-%m-%d")
+    usage = state.get("usage") if isinstance(state.get("usage"), dict) else {}
+    changed = False
+    if usage.get("month") != month:
+        usage = {"month": month, "month_credits_used": 0, "day": day, "day_credits_used": 0}
+        changed = True
+    elif usage.get("day") != day:
+        usage["day"] = day
+        usage["day_credits_used"] = 0
+        changed = True
+    usage.setdefault("month_credits_used", 0)
+    usage.setdefault("day_credits_used", 0)
+    state["usage"] = usage
+    return usage, changed
+
+
+def _rootdata_post(endpoint: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+    if not ROOTDATA_API_KEY:
+        raise RuntimeError("ROOTDATA_API_KEY is not configured")
+    url = f"https://api.rootdata.com/open/{endpoint}"
+    response = requests.post(
+        url,
+        headers={"apikey": ROOTDATA_API_KEY, "language": "en", "Content-Type": "application/json"},
+        json=body or {},
+        timeout=(4, 18),
+    )
+    if response.status_code == 429:
+        raise RuntimeError(f"RootData {endpoint} rate limit (HTTP 429)")
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"RootData {endpoint} returned an unexpected response")
+    result_code = payload.get("result")
+    if result_code not in (None, 200, "200"):
+        raise RuntimeError(f"RootData {endpoint} API result={result_code}: {str(payload.get('message') or '')[:180]}")
+    data = payload.get("data")
+    return {"data": data, "message": payload.get("message", ""), "result": result_code}
+
+
+def rootdata_remaining_credits() -> int | None:
+    """Query RootData's documented free quota endpoint without consuming API credits."""
+    if not ROOTDATA_API_KEY:
+        return None
+    try:
+        result = _rootdata_post("quotacredits", {})
+        data = result.get("data")
+        if isinstance(data, dict) and data.get("credits") is not None:
+            return max(0, int(data.get("credits")))
+        print("  [rootdata] quota endpoint did not report a remaining-credit count; detail calls disabled")
+    except Exception as exc:
+        print(f"  [rootdata] quota check unavailable; paid detail calls disabled: {type(exc).__name__}: {exc}")
+    return None
+
+
+def _rootdata_name_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _rootdata_match_project(query: str, results: Any) -> dict[str, Any] | None:
+    if isinstance(results, dict):
+        results = results.get("items") or results.get("list") or results.get("results") or [results]
+    if not isinstance(results, list):
+        return None
+    qkey = _rootdata_name_key(query)
+    if not qkey:
+        return None
+    candidates = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        # RootData type: 1 Project, 2 VC, 3 Person. Never match an investor/person.
+        try:
+            if int(item.get("type")) != 1:
+                continue
+        except (TypeError, ValueError):
+            continue
+        name = str(item.get("name") or item.get("project_name") or "").strip()
+        if not name:
+            continue
+        key = _rootdata_name_key(name)
+        exact = key == qkey
+        similarity = difflib.SequenceMatcher(a=qkey, b=key).ratio() if min(len(qkey), len(key)) >= 6 else 0.0
+        # Fuzzy matching is only allowed for longer names; ambiguous names like Arc/OP are exact-only.
+        if exact:
+            score = 1.0
+        elif min(len(qkey), len(key)) >= 8 and similarity >= 0.94:
+            score = similarity
+        else:
+            continue
+        candidates.append((score, item))
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    if not candidates:
+        return None
+    if len(candidates) > 1 and candidates[0][0] - candidates[1][0] < 0.035:
+        return None
+    return candidates[0][1]
+
+
+def _rootdata_sanitized_detail(raw: dict[str, Any]) -> dict[str, Any]:
+    """Keep only Basic-friendly project metadata. Deliberately drop team, funding, and investor data."""
+    social = raw.get("social_media")
+    social_out: dict[str, str] = {}
+    if isinstance(social, dict):
+        for key in ("website", "twitter", "x", "discord", "linkedin", "medium", "github", "telegram"):
+            value = social.get(key)
+            if isinstance(value, str) and value.strip():
+                social_out[key] = value.strip()[:500]
+    elif isinstance(social, list):
+        for item in social:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("type") or item.get("name") or item.get("platform") or "").lower()
+            value = item.get("url") or item.get("link") or item.get("value")
+            if value and key and any(term in key for term in ("website", "twitter", "x", "discord", "linkedin", "medium", "github", "telegram")):
+                social_out[key] = str(value).strip()[:500]
+    tags = raw.get("tags") if isinstance(raw.get("tags"), list) else []
+    return {
+        "project_id": raw.get("project_id"),
+        "project_name": str(raw.get("project_name") or "")[:180],
+        "one_liner": str(raw.get("one_liner") or "")[:500],
+        "description": str(raw.get("description") or "")[:1800],
+        "establishment_date": str(raw.get("establishment_date") or "")[:40],
+        "project_type": str(raw.get("project_type") or "")[:80],
+        "tags": [str(tag)[:80] for tag in tags[:20]],
+        "rootdataurl": str(raw.get("rootdataurl") or "")[:500],
+        "social_media": social_out,
+    }
+
+
+def rootdata_project_lookup(project_name: str) -> dict[str, Any] | None:
+    """Find an exact RootData project; enrich from its Basic profile within strict credit caps.
+
+    Search is documented as unlimited times. /get_item costs 2 credits. This function caps
+    this install at 24 credits/day and 800 credits/month, keeps at least 200 credits on the
+    actual account balance, and caches project details for reuse between workflow runs.
+    The returned profile is metadata only: never launch/founder/prior-builder proof.
+    """
+    name = str(project_name or "").strip()
+    if not ROOTDATA_API_KEY or not name:
+        return None
+    state = _rootdata_load_state()
+    usage, period_changed = _rootdata_current_period(state)
+    search_cache = state.get("search_cache") if isinstance(state.get("search_cache"), dict) else {}
+    detail_cache = state.get("project_cache") if isinstance(state.get("project_cache"), dict) else {}
+    cache_key = _rootdata_name_key(name)
+    now_ts = time.time()
+    cached_search = search_cache.get(cache_key)
+    search_match = None
+    if isinstance(cached_search, dict) and float(cached_search.get("expires_at", 0) or 0) > now_ts:
+        search_match = cached_search.get("match") if isinstance(cached_search.get("match"), dict) else None
+    else:
+        try:
+            response = _rootdata_post("ser_inv", {"query": name})
+            search_match = _rootdata_match_project(name, response.get("data"))
+            # Positive search cache: 30 days; negative: 24 hours so new listings can appear.
+            search_cache[cache_key] = {"expires_at": now_ts + (30 * 86400 if search_match else 86400), "match": search_match}
+            state["search_cache"] = search_cache
+            if period_changed:
+                state["usage"] = usage
+            _rootdata_save_state(state)
+        except Exception as exc:
+            print(f"  [rootdata] project search unavailable for {name!r}: {type(exc).__name__}: {exc}")
+            return None
+    if not search_match:
+        print(f"  [rootdata] no unambiguous RootData project match for {name!r}; no credits spent")
+        return None
+    try:
+        project_id = int(search_match.get("id") or search_match.get("project_id"))
+    except (TypeError, ValueError):
+        return {"search": search_match, "detail": None, "metadata_only": True}
+
+    cache_entry = detail_cache.get(str(project_id))
+    detail = None
+    if isinstance(cache_entry, dict) and isinstance(cache_entry.get("data"), dict):
+        detail = cache_entry["data"]
+        print(f"  [rootdata] cached Basic project details reused for {name!r}; 0 credits spent")
+    else:
+        local_month_used = int(usage.get("month_credits_used", 0) or 0)
+        local_day_used = int(usage.get("day_credits_used", 0) or 0)
+        if local_month_used + ROOTDATA_DETAIL_CREDIT_COST > ROOTDATA_MONTHLY_CREDIT_CAP:
+            print(f"  [rootdata] local monthly cap reached ({local_month_used}/{ROOTDATA_MONTHLY_CREDIT_CAP} credits); using search summary only")
+            return {"search": search_match, "detail": None, "metadata_only": True}
+        if local_day_used + ROOTDATA_DETAIL_CREDIT_COST > ROOTDATA_DAILY_CREDIT_CAP:
+            print(f"  [rootdata] local daily cap reached ({local_day_used}/{ROOTDATA_DAILY_CREDIT_CAP} credits); using search summary only")
+            return {"search": search_match, "detail": None, "metadata_only": True}
+        remaining = rootdata_remaining_credits()
+        if remaining is None or remaining - ROOTDATA_DETAIL_CREDIT_COST < ROOTDATA_RESERVE_CREDITS:
+            print(f"  [rootdata] actual balance unknown/near reserve ({remaining}); using search summary only")
+            return {"search": search_match, "detail": None, "metadata_only": True}
+        try:
+            # Basic plan only: omit include_team/include_investors and strip out any restricted fields.
+            response = _rootdata_post("get_item", {"project_id": project_id})
+            raw_detail = response.get("data")
+            if not isinstance(raw_detail, dict) or not raw_detail:
+                print(f"  [rootdata] no detail profile returned for {name!r}; no confirmed credit debit recorded")
+                return {"search": search_match, "detail": None, "metadata_only": True}
+            detail = _rootdata_sanitized_detail(raw_detail)
+            usage["month_credits_used"] = local_month_used + ROOTDATA_DETAIL_CREDIT_COST
+            usage["day_credits_used"] = local_day_used + ROOTDATA_DETAIL_CREDIT_COST
+            state["usage"] = usage
+            detail_cache[str(project_id)] = {"fetched_at": datetime.now(timezone.utc).isoformat(), "data": detail}
+            # Keep state bounded for fast workflow commits.
+            if len(detail_cache) > 450:
+                oldest = sorted(detail_cache.items(), key=lambda pair: str(pair[1].get("fetched_at", "")) if isinstance(pair[1], dict) else "")
+                for old_id, _ in oldest[:len(detail_cache) - 450]:
+                    detail_cache.pop(old_id, None)
+            state["project_cache"] = detail_cache
+            # Bound query cache while preferring to retain positive names.
+            if len(search_cache) > 900:
+                ordered = sorted(search_cache.items(), key=lambda pair: (isinstance(pair[1], dict) and bool(pair[1].get("match")), float(pair[1].get("expires_at", 0) or 0)))
+                for old_key, _ in ordered[:len(search_cache) - 900]:
+                    search_cache.pop(old_key, None)
+                state["search_cache"] = search_cache
+            _rootdata_save_state(state)
+            print(f"  [rootdata] details fetched for {name!r}; +{ROOTDATA_DETAIL_CREDIT_COST} credits; local month={usage['month_credits_used']}/{ROOTDATA_MONTHLY_CREDIT_CAP}, day={usage['day_credits_used']}/{ROOTDATA_DAILY_CREDIT_CAP}, remaining account credits={remaining - ROOTDATA_DETAIL_CREDIT_COST}")
+        except Exception as exc:
+            print(f"  [rootdata] detail fetch unavailable for {name!r}: {type(exc).__name__}: {exc}")
+            return {"search": search_match, "detail": None, "metadata_only": True}
+    return {"search": search_match, "detail": detail, "metadata_only": not bool(detail)}
+
+
+def rootdata_metadata_for_candidate(project_name: str) -> dict[str, Any] | None:
+    """Return concise RootData Basic metadata for verification context, if available."""
+    record = rootdata_project_lookup(project_name)
+    if not record:
+        return None
+    search = record.get("search") if isinstance(record.get("search"), dict) else {}
+    detail = record.get("detail") if isinstance(record.get("detail"), dict) else {}
+    social = detail.get("social_media") if isinstance(detail.get("social_media"), dict) else {}
+    return {
+        "name": str(detail.get("project_name") or search.get("name") or project_name)[:160],
+        "introduction": str(detail.get("one_liner") or search.get("introduce") or "")[:500],
+        "description": str(detail.get("description") or "")[:900],
+        "establishment_date": str(detail.get("establishment_date") or "")[:40],
+        "project_type": str(detail.get("project_type") or "")[:50],
+        "tags": detail.get("tags") if isinstance(detail.get("tags"), list) else [],
+        "rootdata_url": str(detail.get("rootdataurl") or search.get("rootdataurl") or "")[:500],
+        "social_media": social,
+        "metadata_only": True,
+    }
+
 def _walk_dicts(value: Any):
     if isinstance(value, dict):
         yield value
@@ -567,6 +846,68 @@ def fetch_research_page(url: str, *, source_label: str = "Web page", max_chars: 
         return None
 
 
+def fetch_github_link_evidence(url: str) -> dict[str, Any] | None:
+    """Fetch public metadata for a GitHub profile/repository already linked by the project site.
+
+    This is an evidence-enrichment helper, not independent proof that a person founded a
+    project. Association must come from an official project/team page; repository metadata
+    can only support prior product/build history when that association is also evidenced.
+    """
+    try:
+        parsed = urllib.parse.urlparse(str(url or ""))
+        if (parsed.hostname or "").lower().removeprefix("www.") != "github.com":
+            return None
+        parts = [p for p in parsed.path.split("/") if p]
+        reserved = {"features", "topics", "collections", "marketplace", "login", "signup", "settings", "orgs", "sponsors", "enterprise"}
+        if not parts or parts[0].lower() in reserved or parts[0].startswith("?"):
+            return None
+        if len(parts) >= 2 and parts[1].lower() not in {"followers", "following", "repositories", "projects", "packages", "stars"}:
+            owner, repo = parts[0], parts[1].removesuffix(".git")
+            api_url = f"https://api.github.com/repos/{urllib.parse.quote(owner, safe='')}/{urllib.parse.quote(repo, safe='')}"
+            response = requests.get(api_url, timeout=(4, 10), headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "StartupIntelligenceTracker/1.0",
+            })
+            if response.status_code in {403, 404, 429}:
+                return None
+            response.raise_for_status()
+            data = response.json()
+            body = (
+                f"Public GitHub repository. Name: {data.get('full_name', '')}. "
+                f"Description: {data.get('description') or ''}. Owner: {((data.get('owner') or {}).get('login') or '')}. "
+                f"Owner type: {((data.get('owner') or {}).get('type') or '')}. "
+                f"Created: {data.get('created_at') or ''}. Last pushed: {data.get('pushed_at') or ''}. "
+                f"Primary language: {data.get('language') or ''}. Topics: {', '.join(data.get('topics') or [])}. "
+                f"Homepage: {data.get('homepage') or ''}. Stars: {data.get('stargazers_count') or 0}."
+            )
+            return {"title": f"GitHub repository: {data.get('full_name') or owner + '/' + repo}",
+                    "publisher": "GitHub public repository metadata", "url": data.get("html_url") or url,
+                    "body": body, "links": []}
+        login = parts[0]
+        api_url = f"https://api.github.com/users/{urllib.parse.quote(login, safe='')}"
+        response = requests.get(api_url, timeout=(4, 10), headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "StartupIntelligenceTracker/1.0",
+        })
+        if response.status_code in {403, 404, 429}:
+            return None
+        response.raise_for_status()
+        data = response.json()
+        body = (
+            f"Public GitHub user profile. Username: {data.get('login') or login}. "
+            f"Public name: {data.get('name') or ''}. Bio: {data.get('bio') or ''}. "
+            f"Company: {data.get('company') or ''}. Blog/site: {data.get('blog') or ''}. "
+            f"Created: {data.get('created_at') or ''}. Public repositories: {data.get('public_repos') or 0}. "
+            f"Public profile URL: {data.get('html_url') or url}."
+        )
+        return {"title": f"GitHub profile: {data.get('name') or login}",
+                "publisher": "GitHub public profile metadata", "url": data.get("html_url") or url,
+                "body": body, "links": []}
+    except Exception as exc:
+        print(f"  [verify] GitHub linked-page enrichment unavailable: {type(exc).__name__}")
+        return None
+
+
 def _verification_queries(project: str, candidate: dict[str, Any], item: dict[str, Any], website_host: str = "") -> list[str]:
     title = re.sub(r"\s+", " ", str(item.get("title") or "")).strip()[:140]
     queries = [
@@ -604,8 +945,27 @@ def verify_crypto_launch_quality(client: Groq, item: dict[str, Any], candidate: 
     project = str(candidate.get("project") or "").strip()
     category = str(candidate.get("project_category") or "").strip()
     if not project or excluded_nft_or_meme(candidate):
+        # Apply the cheap hard exclusion before any RootData detail lookup so excluded categories
+        # never consume project-detail credits.
         return False, {"quality_gate_pass": False, "project_category": category or "NFT/meme/unknown",
                        "quality_gate_reason": "Rejected by NFT/meme or missing-project hard filter."}, []
+    # RootData Basic is used for metadata/official-link enrichment only. Its registry record
+    # never counts as proof of a dated launch, public founder identity, or prior shipped work.
+    if not ROOTDATA_API_KEY:
+        print("  [rootdata] ROOTDATA_API_KEY not configured; skipping Basic metadata enrichment")
+    rootdata_meta = rootdata_metadata_for_candidate(project) if ROOTDATA_API_KEY else None
+    if rootdata_meta:
+        rd_social = rootdata_meta.get("social_media") if isinstance(rootdata_meta.get("social_media"), dict) else {}
+        if not candidate.get("website") and rd_social.get("website"):
+            candidate["website"] = rd_social.get("website")
+        if not candidate.get("twitter") and not candidate.get("x_handle"):
+            x_link = rd_social.get("twitter") or rd_social.get("x")
+            if x_link:
+                candidate["twitter"] = x_link
+        rd_tags = rootdata_meta.get("tags") if isinstance(rootdata_meta.get("tags"), list) else []
+        if not candidate.get("niche_presence") and rd_tags:
+            candidate["niche_presence"] = ", ".join(str(tag) for tag in rd_tags[:8])
+        print(f"  [rootdata] matched Basic metadata for {project!r}; rootdata profile is context-only, not qualification evidence")
 
     raw_names = _as_name_list(candidate.get("founders"))
     evidence: list[dict[str, str]] = []
@@ -630,7 +990,8 @@ def verify_crypto_launch_quality(client: Groq, item: dict[str, Any], candidate: 
     # founder and prior-product context needed for a strict verification pass.
     add_evidence({"title": item.get("title", ""), "publisher": item.get("publisher", "Unknown"),
                   "url": item.get("link", ""), "body": item.get("body", "")[:1200]})
-    article_page = fetch_research_page(str(item.get("link") or ""), source_label=str(item.get("publisher") or "Launch source"), max_chars=2200)
+    article_label = "DeFiLlama listing page" if item.get("source_type") == "defillama_protocol" else str(item.get("publisher") or "Launch source")
+    article_page = fetch_research_page(str(item.get("link") or ""), source_label=article_label, max_chars=2200)
     add_evidence(article_page)
 
     website = str(candidate.get("website") or "").strip()
@@ -639,25 +1000,88 @@ def verify_crypto_launch_quality(client: Groq, item: dict[str, Any], candidate: 
     website_page = fetch_research_page(website, source_label="Official project website", max_chars=2100) if website else None
     add_evidence(website_page)
 
-    # Follow only public, same-site people/about/founder links found on the real homepage.
+    # Follow public, same-site founder/team and launch/news/blog links from the real homepage.
+    # Also probe a few conventional paths because many early-stage project sites have sparse nav
+    # markup or JS-rendered menus that the lightweight HTML parser cannot see.
     website_host = ""
+    website_pages: list[dict[str, Any]] = []
     if website_page:
+        website_pages.append(website_page)
         parsed_website = urllib.parse.urlparse(str(website_page.get("url") or website))
         website_host = (parsed_website.hostname or "").lower().removeprefix("www.")
-        selected_links = []
-        for url, label in website_page.get("links", []):
-            full = urllib.parse.urlparse(url)
+        team_links: list[tuple[str, str]] = []
+        launch_links: list[tuple[str, str]] = []
+        for link_url, label in website_page.get("links", []):
+            full = urllib.parse.urlparse(link_url)
             host = (full.hostname or "").lower().removeprefix("www.")
-            searchable = f"{full.path} {label}".lower()
             if host != website_host:
                 continue
+            searchable = f"{full.path} {label}".lower()
+            pair = (link_url, label or full.path)
             if re.search(r"\b(about|team|founder|leadership|company|people|our-story|who-we-are|contributors|core-team)\b", searchable):
-                if url not in [x[0] for x in selected_links]:
-                    selected_links.append((url, label or full.path))
-            if len(selected_links) >= 3:
+                if pair not in team_links:
+                    team_links.append(pair)
+            if re.search(r"\b(launch|blog|news|announc|mainnet|testnet|release|changelog|product)\b", searchable):
+                if pair not in launch_links:
+                    launch_links.append(pair)
+
+        selected_team = team_links[:3]
+        selected_launch = launch_links[:2]
+        seen_page_urls = {str(website_page.get("url") or website)}
+        # If no people links are exposed in navigation, try two conventional pages.
+        if len(selected_team) < 2:
+            for path in ("/about", "/team", "/about-us", "/founders"):
+                url = urllib.parse.urljoin(website.rstrip("/") + "/", path.lstrip("/"))
+                if url not in seen_page_urls and len(selected_team) < 2:
+                    selected_team.append((url, path.strip("/")))
+                    seen_page_urls.add(url)
+        # Registry leads need a separate launch announcement. Look at a limited set of project
+        # news/blog pages if homepage navigation doesn't expose one.
+        if item.get("source_type") == "defillama_protocol" and len(selected_launch) < 2:
+            for path in ("/blog", "/news", "/announcements"):
+                url = urllib.parse.urljoin(website.rstrip("/") + "/", path.lstrip("/"))
+                if url not in seen_page_urls and len(selected_launch) < 2:
+                    selected_launch.append((url, path.strip("/")))
+                    seen_page_urls.add(url)
+
+        for url, label in (selected_team + selected_launch):
+            seen_page_urls.add(url)
+            page = fetch_research_page(url, source_label=f"Official website: {label}", max_chars=1800)
+            if page:
+                website_pages.append(page)
+                add_evidence(page)
+
+        # If a blog/news index was found, inspect at most two same-site launch/article links.
+        followed_launches = 0
+        for page in website_pages[1:]:
+            for link_url, label in page.get("links", []):
+                full = urllib.parse.urlparse(link_url)
+                host = (full.hostname or "").lower().removeprefix("www.")
+                searchable = f"{full.path} {label}".lower()
+                if host != website_host or link_url in seen_page_urls:
+                    continue
+                if re.search(r"\b(launch|mainnet|testnet|announcement|release|introducing|we-launched|our-launch)\b", searchable):
+                    page2 = fetch_research_page(link_url, source_label=f"Official launch page: {label or full.path}", max_chars=1900)
+                    seen_page_urls.add(link_url)
+                    if page2:
+                        website_pages.append(page2)
+                        add_evidence(page2)
+                        followed_launches += 1
+                    if followed_launches >= 2:
+                        break
+            if followed_launches >= 2:
                 break
-        for url, label in selected_links:
-            add_evidence(fetch_research_page(url, source_label=f"Official website: {label}", max_chars=1800))
+
+        # Public GitHub profiles/repositories linked by the project's own pages can support
+        # builder-history verification, but are never treated as founder proof by themselves.
+        github_links = []
+        for page in website_pages:
+            for link_url, _label in page.get("links", []):
+                parsed = urllib.parse.urlparse(link_url)
+                if (parsed.hostname or "").lower().removeprefix("www.") == "github.com" and link_url not in github_links:
+                    github_links.append(link_url)
+        for github_url in github_links[:4]:
+            add_evidence(fetch_github_link_evidence(github_url))
 
     # Free, unofficial profile timeline is an enrichment source only. Obtain handles from
     # the actual protocol record or links on the official website; never invent account names.
@@ -758,6 +1182,8 @@ SOURCES: """ + json.dumps(evidence[:10], ensure_ascii=False) + "\n"
                 time.sleep(0.12)
     evidence = evidence[:20]
     verification_candidate = dict(candidate)
+    if rootdata_meta:
+        verification_candidate["rootdata_metadata_context_only"] = rootdata_meta
     if discovered_founders:
         verification_candidate["founders"] = discovered_founders
     print(f"  [verify] evidence pool={len(evidence)} unique sources; web-search items={query_result_count}; official website={'yes' if website_page else 'no'}")
@@ -781,7 +1207,8 @@ SOURCES: """ + json.dumps(evidence[:10], ensure_ascii=False) + "\n"
  "confidence": "High|Medium|Low",
  "quality_gate_reason": "brief factual reason"
 }
-PASS ONLY if all are evidenced: (1) a supplied source independent of any DeFiLlama registry explicitly announces a substantive new product/protocol/mainnet/testnet/developer infrastructure/wallet/security/DeFi/payments launch; (2) the project is NOT primarily NFT/PFP/collectibles or a meme coin/token and is not a token-only launch without substantive product utility; (3) at least one project founder or explicitly identified founding team member is publicly named in supplied source material; (4) at least one named founder previously built/shipped a real Web3 product/protocol or founded a Web3 company with a product. Merely working in crypto, advising, investing, marketing, influencing, running a community or making an unshipped announcement does not qualify. Do not infer identity from a pseudonymous X handle. Do not use model memory as evidence. Do not invent names, roles, projects or URLs. Every evidence URL must exactly match a URL in the supplied source list. `verified_launch_date` may only be returned when an independent launch source explicitly supports it; never use DeFiLlama listedAt as launch date. If any criterion lacks evidence, fail closed and explain which evidence is missing. Prefer credible media, official team/about pages, project documentation, GitHub organizations or verifiable prior-project sources.
+RootData metadata in the initial candidate is only a directory/metadata clue. It is NOT independent launch evidence, NOT proof of public founder identity, and NOT proof of prior shipped Web3 work. Do not count it as one of the evidence URLs.
+PASS ONLY if all are evidenced: (1) a supplied source independent of any DeFiLlama or RootData registry explicitly announces a substantive new product/protocol/mainnet/testnet/developer infrastructure/wallet/security/DeFi/payments launch; (2) the project is NOT primarily NFT/PFP/collectibles or a meme coin/token and is not a token-only launch without substantive product utility; (3) at least one project founder or explicitly identified founding team member is publicly named in supplied source material; (4) at least one named founder previously built/shipped a real Web3 product/protocol or founded a Web3 company with a product. Merely working in crypto, advising, investing, marketing, influencing, running a community or making an unshipped announcement does not qualify. Do not infer identity from a pseudonymous X handle. Do not use model memory as evidence. Do not invent names, roles, projects or URLs. Every evidence URL must exactly match a URL in the supplied source list. `verified_launch_date` may only be returned when an independent launch source explicitly supports it; never use DeFiLlama listedAt as launch date. If any criterion lacks evidence, fail closed and explain which evidence is missing. Prefer credible media, official team/about pages, project documentation, GitHub organizations or verifiable prior-project sources.
 
 INITIAL CANDIDATE:
 """ + json.dumps(verification_candidate, ensure_ascii=False) + r"""
@@ -808,6 +1235,10 @@ PROJECT / FOUNDER SEARCH RESULTS AND OFFICIAL WEB PAGES:
     except Exception:
         verified_launch_date = ""
     launch_evidence_record = next((entry for entry in evidence if entry.get("url") == launch_url), None)
+    # Code-level evidence guard: the selected launch source must itself contain a launch cue
+    # plus crypto/Web3 context. A homepage/team page or DeFiLlama registry listing is not launch
+    # proof, even if the model incorrectly labels it as such.
+    launch_source_has_cue = bool(launch_evidence_record and launch_signal_score(launch_evidence_record) > 0)
     if not launch_evidence_record or str(launch_evidence_record.get("publisher") or "").lower().startswith("defillama"):
         verified_launch_date = ""
     if item.get("source_type") == "defillama_protocol" and verified_launch_date == str(item.get("listed_at") or ""):
@@ -818,7 +1249,7 @@ PROJECT / FOUNDER SEARCH RESULTS AND OFFICIAL WEB PAGES:
                   verified.get("founders_publicly_identified") is True,
                   verified.get("prior_web3_builder_track_record") is True,
                   bool(founders), bool(projects), founder_url in allowed_urls,
-                  track_url in allowed_urls, launch_url in allowed_urls,
+                  track_url in allowed_urls, launch_url in allowed_urls, launch_source_has_cue,
                   category_out.lower() not in {"", "other", "unknown", "nft/collectibles", "meme/memecoin"},
                   not excluded_nft_or_meme(exclusion_check),
                   str(verified.get("confidence", "")).lower() in {"high", "medium"}))
@@ -831,7 +1262,10 @@ PROJECT / FOUNDER SEARCH RESULTS AND OFFICIAL WEB PAGES:
     verified["quality_gate_pass"] = bool(passed)
     verified["verified_launch_date"] = verified_launch_date
     if not passed and not verified.get("quality_gate_reason"):
-        verified["quality_gate_reason"] = "Failed a required evidence check: launch, non-NFT/non-meme category, public founder, previous shipped Web3 work, evidence URLs or confidence."
+        if not launch_source_has_cue:
+            verified["quality_gate_reason"] = "No independent launch source with an explicit launch cue and Web3 context; registry listings and generic homepages do not count."
+        else:
+            verified["quality_gate_reason"] = "Failed a required evidence check: launch, non-NFT/non-meme category, public founder, previous shipped Web3 work, evidence URLs or confidence."
     urls = []
     for url in (founder_url, track_url, launch_url):
         if url and url in allowed_urls and url not in urls:

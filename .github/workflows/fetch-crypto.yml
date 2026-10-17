@@ -2,11 +2,14 @@ name: fetch-crypto-launch-radar
 
 on:
   schedule:
-    - cron: "43 * * * *"
+    - cron: "55 * * * *"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 concurrency:
-  group: startup-intelligence-crypto
+  group: startup-intelligence-rootdata-state
   cancel-in-progress: false
 
 jobs:
@@ -21,6 +24,10 @@ jobs:
           cache: "pip"
       - name: Install dependencies
         run: pip install -r requirements.txt
+      - name: Check RootData Basic API and credit guard (no project-detail credits)
+        env:
+          ROOTDATA_API_KEY: ${{ secrets.ROOTDATA_API_KEY }}
+        run: python rootdata_check.py
       - name: Run crypto launch radar
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
@@ -29,5 +36,25 @@ jobs:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
           WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
           X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
+          ROOTDATA_API_KEY: ${{ secrets.ROOTDATA_API_KEY }}
+          ROOTDATA_MONTHLY_CREDIT_CAP: "800"
+          ROOTDATA_DAILY_CREDIT_CAP: "24"
+          ROOTDATA_RESERVE_CREDITS: "200"
           CRYPTO_MAX_ITEMS_PER_RUN: "2"
         run: python crypto_launches.py
+
+      - name: Persist RootData cache and credit ledger
+        if: ${{ always() && github.ref == 'refs/heads/main' }}
+        shell: bash
+        run: |
+          if [ ! -d .backfill-state ]; then exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A .backfill-state
+          if git diff --cached --quiet; then
+            echo "No RootData cache or credit-ledger updates to persist."
+            exit 0
+          fi
+          git commit -m "chore(rootdata): persist cached lookups and credit usage"
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          git push origin "HEAD:$GITHUB_REF_NAME"

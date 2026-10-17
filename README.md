@@ -1,3 +1,5 @@
+> **v12 hotfix (Oct 17, 2026):** For a one-time historical recheck, `recheck_processed_sources=true` now raises the per-run candidate cap to 60 so the first week can finish in one run. Scheduled backfills remain capped at 6 candidates/hour. Founder verification now checks a small number of official team/about and blog/news pages and reads only publicly linked GitHub metadata. See `V12-INSTALL.md` before deploying.
+
 # Startup Intelligence Tracker (v6)
 
 Two Google Sheets data streams powered by Python, Groq, GitHub Actions, and a Google Apps Script webhook:
@@ -134,3 +136,11 @@ To deploy: replace the matching repository files from the v9 patch, commit and p
 This update supplements RSS/Google News with DeFiLlama's public no-key `/protocols` endpoint and uses public X profile syndication only when a project handle has already been discovered from an official/source record. It does not call DeFiLlama `/api/raises` (paid) or require an X API token. The syndication endpoint is unofficial, recent-profile-only, and may stop working. Neither route is a replacement for X keyword/full-archive search.
 
 To apply v11, replace `tracker_common.py`, `backfill_crypto.py`, `crypto_launches.py`, `README.md`, and `CHANGELOG.md`, then commit/push to `main`. The Apps Script schema is unchanged, so no Apps Script redeploy is required. Re-run `backfill-crypto-launch-radar` with `reset_cursor=false`; existing processed URLs remain deduplicated. DeFiLlama `listedAt` is never written as the launch date.
+
+### RootData Basic API integration (optional)
+
+Set a GitHub Actions repository secret named `ROOTDATA_API_KEY` to enable RootData Basic metadata enrichment. The current official docs describe `/open/ser_inv` project/VC/person search as unlimited (still subject to 60 requests/minute), `/open/quotacredits` as free, and `/open/get_item` as 2 credits per project. This integration only uses project search and basic project details; it does not call fundraising-round, investor-detail, comprehensive people, or Pro-only endpoints.
+
+Credit protection: each workflow checks the free RootData quota endpoint before a project-detail request; the tracker reserves at least 200 credits on the account, caps its own spend at 24 credits/day and 800 credits/month, and caches detail lookups in `.backfill-state/rootdata-state.json`. Search hits/misses are cached too. The live crypto and crypto-backfill workflows serialize access to this ledger and persist it to `main`. At most 12 uncached project-detail requests per UTC day are possible under the daily cap (2 credits each); cached lookups cost 0 additional credits. If the quota endpoint cannot confirm remaining credits, paid detail lookups are skipped, and the pipeline continues with existing sources.
+
+RootData records are metadata only. A project listing/description never satisfies the independent launch-announcement, named-founder, or prior shipped Web3-builder evidence requirements. Funding and investor fields are intentionally ignored because they are not included in the Basic plan shown for this key. The tracker still works without `ROOTDATA_API_KEY`.
