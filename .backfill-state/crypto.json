@@ -1,11 +1,11 @@
 {
-  "completed_through": "2026-09-25",
+  "completed_through": "2026-10-02",
   "last_completed_window": {
-    "end_exclusive": "2026-09-26",
-    "start": "2026-09-19"
+    "end_exclusive": "2026-10-03",
+    "start": "2026-09-26"
   },
-  "next_start": "2026-09-26",
+  "next_start": "2026-10-03",
   "status": "in_progress",
   "stream": "crypto",
-  "updated_at_utc": "2026-10-27T18:58:51+00:00"
+  "updated_at_utc": "2026-10-30T06:26:58+00:00"
 }
