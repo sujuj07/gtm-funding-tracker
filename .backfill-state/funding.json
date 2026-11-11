@@ -1,11 +1,11 @@
 {
-  "completed_through": "2026-08-14",
+  "completed_through": "2026-08-21",
   "last_completed_window": {
-    "end_exclusive": "2026-08-15",
-    "start": "2026-08-08"
+    "end_exclusive": "2026-08-22",
+    "start": "2026-08-15"
   },
-  "next_start": "2026-08-15",
+  "next_start": "2026-08-22",
   "status": "in_progress",
   "stream": "funding",
-  "updated_at_utc": "2026-11-06T09:19:01+00:00"
+  "updated_at_utc": "2026-11-11T14:09:37+00:00"
 }
