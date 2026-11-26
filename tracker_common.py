@@ -237,8 +237,32 @@ def google_news_rss_url(query: str, after: str | None = None, before: str | None
     return f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
 
 
+# Google News titles are "Headline - Publisher". Used only as a fallback when the
+# feed omits the structured <source> element.
+_TITLE_PUBLISHER = re.compile(r"\s[-–—]\s([^-–—]{2,60})$")
+
+
+def _entry_publisher(entry: Any, title: str) -> str:
+    """Pull the real publisher out of an RSS entry.
+
+    Google News aggregates other outlets, so the useful publisher is per-entry
+    (Inc42, TechCrunch...) rather than per-feed. Prefer the structured <source>
+    element, then the "- Publisher" suffix on the title.
+    """
+    source = entry.get("source") if hasattr(entry, "get") else None
+    if isinstance(source, dict):
+        name = strip_html(str(source.get("title") or "")).strip()
+        if name:
+            return name[:80]
+    match = _TITLE_PUBLISHER.search(title or "")
+    if match:
+        return match.group(1).strip()[:80]
+    return ""
+
+
 def fetch_rss_feed(
-    url: str, limit: int = 12, label: str = "", *, strict: bool = False
+    url: str, limit: int = 12, label: str = "", *, strict: bool = False,
+    publisher_from_entry: bool = False, discovery_query: str = "",
 ) -> list[dict]:
     """Fetch and parse an RSS feed.
 
@@ -260,13 +284,24 @@ def fetch_rss_feed(
             link = entry.get("link", "")
             if not link:
                 continue
+            title = strip_html(entry.get("title", ""))
+            # The Source Publisher column was being filled with the search query,
+            # because Google News passed label="Google News: <query>" and that label
+            # went straight to the sheet. Keep the query as provenance, but report the
+            # outlet that actually published the story.
+            publisher = ""
+            if publisher_from_entry:
+                publisher = _entry_publisher(entry, title)
+            if not publisher:
+                publisher = label or feed.feed.get("title", "RSS")
             results.append({
-                "title": strip_html(entry.get("title", "")),
+                "title": title,
                 "body": strip_html(entry.get("summary", entry.get("description", "")))[:2400],
                 "link": link,
                 "published": entry.get("published", entry.get("updated", "")),
                 "published_parsed": entry.get("published_parsed", entry.get("updated_parsed")),
-                "publisher": label or feed.feed.get("title", "RSS"),
+                "publisher": publisher,
+                "discovery_query": discovery_query,
                 "source_type": "rss",
             })
     except Exception as exc:
@@ -281,7 +316,12 @@ def fetch_google_news(
     limit: int = 12, *, strict: bool = False,
 ) -> list[dict]:
     url = google_news_rss_url(query, after, before)
-    return fetch_rss_feed(url, limit=limit, label="Google News: " + query, strict=strict)
+    # publisher_from_entry: Google News is an aggregator, so the publisher worth
+    # recording is the outlet behind each item, not "Google News: <query>".
+    return fetch_rss_feed(
+        url, limit=limit, label="Google News", strict=strict,
+        publisher_from_entry=True, discovery_query=query,
+    )
 
 def _listing_date(value: Any) -> str:
     """Parse DeFiLlama listedAt timestamps to an ISO UTC date."""
@@ -1441,6 +1481,31 @@ def webhook_get(stream: str, action: str) -> set[str]:
     return set(str(x) for x in values if x)
 
 
+def webhook_get_enrichment_queue(limit: int = 60, max_age_days: int = 14) -> list[dict]:
+    """Fetch the rows that still need an ATS board check.
+
+    Returned highest-score-first by the Apps Script, so a capped run spends its
+    request budget on the most promising targets rather than on sheet order.
+    """
+    response = requests.get(
+        WEBHOOK_URL,
+        params={"token": WEBHOOK_TOKEN, "stream": "funding", "action": "enrichment_queue",
+                "limit": str(limit), "maxAgeDays": str(max_age_days)},
+        timeout=60,
+    )
+    response.raise_for_status()
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError("Webhook returned non-JSON for enrichment_queue") from exc
+    if not data.get("ok"):
+        raise RuntimeError(f"Webhook GET enrichment_queue failed: {data}")
+    rows = data.get("rows")
+    if not isinstance(rows, list):
+        raise RuntimeError("Webhook response missing 'rows' for enrichment_queue")
+    return [row for row in rows if isinstance(row, dict)]
+
+
 def webhook_get_review_queue() -> list[list[Any]]:
     """Read the visible Crypto Review Queue; errors must not look like an empty queue."""
     response = requests.get(
@@ -1461,18 +1526,22 @@ def webhook_get_review_queue() -> list[list[Any]]:
 def post_rows(
     stream: str, rows: list[list[Any]], processed_sources: list[str] | None = None, *,
     allow_reprocessed_sources: bool = False, review_rows: list[list[Any]] | None = None,
+    intel_updates: list[dict] | None = None,
 ) -> dict | None:
     review_rows = review_rows or []
-    if not rows and not processed_sources and not review_rows:
-        return {"ok": True, "appended": 0, "updated": 0, "reviewAppended": 0, "reviewUpdated": 0, "skipped": 0}
+    intel_updates = intel_updates or []
+    if not rows and not processed_sources and not review_rows and not intel_updates:
+        return {"ok": True, "appended": 0, "updated": 0, "reviewAppended": 0, "reviewUpdated": 0,
+                "intelApplied": 0, "skipped": 0}
     try:
         response = requests.post(
             WEBHOOK_URL,
             json={"token": WEBHOOK_TOKEN, "stream": stream, "rows": rows,
                   "reviewRows": review_rows,
+                  "intelUpdates": intel_updates,
                   "processedSources": processed_sources or [],
                   "allowReprocessedSources": bool(allow_reprocessed_sources)},
-            timeout=60,
+            timeout=90,
         )
         response.raise_for_status()
         try:
@@ -1493,6 +1562,30 @@ def post_rows(
 
 def event_key(company: str, date: str, event_type: str, stage: str = "", amount: Any = "") -> str:
     base = "|".join((norm_company(company), date or "", (event_type or "").lower(), (stage or "").lower(), str(amount or "")))
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()[:20]
+
+
+def funding_event_key(company: str, date: str, event_type: str) -> str:
+    """Stable key for one funding event, at month granularity.
+
+    ``event_key`` includes the exact date, the stage and the amount, so the same
+    raise reported on consecutive days -- or by two outlets that disagree on the
+    amount by a rounding step -- hashed to different keys and became separate
+    rows. That produced 54 companies occupying 142 rows, e.g. Griffin's $20M
+    appearing twice one day apart.
+
+    Keying on company + event type + month collapses a news cycle into one row.
+    The deliberate trade-off: a company that genuinely raises twice within one
+    calendar month will merge. The Apps Script merge keeps the richer value for
+    every field and appends the extra source URLs, so nothing is lost when it
+    happens, and it is far rarer than the duplicate case it fixes.
+    """
+    month = (date or "")[:7]
+    base = "|".join((
+        norm_company(company),
+        (event_type or "funding round").lower().strip(),
+        month,
+    ))
     return hashlib.sha256(base.encode("utf-8")).hexdigest()[:20]
 
 

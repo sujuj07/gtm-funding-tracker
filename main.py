@@ -4,10 +4,11 @@ import time
 from datetime import datetime, timezone
 
 from tracker_common import (
-    MODEL_CHAIN_LABEL, defillama_raises, event_key, extract_json, fetch_google_news,
-    fetch_rss_feed, groq_client, norm_company, parse_event_date, post_rows, published_timestamp,
-    webhook_get, excluded_nft_or_meme,
+    MODEL_CHAIN_LABEL, defillama_raises, extract_json, fetch_google_news,
+    fetch_rss_feed, funding_event_key, groq_client, norm_company, parse_event_date, post_rows,
+    published_timestamp, webhook_get, excluded_nft_or_meme,
 )
+from validate import is_usable, validate_extraction
 
 STREAM = "funding"
 MIN_DELAY = float(os.getenv("MODEL_DELAY_SECONDS", "2.5"))
@@ -146,27 +147,57 @@ def main():
                     flush()
                 time.sleep(MIN_DELAY)
                 continue
-            ev_type = data.get("event_type") or "Funding round"
-            date = data.get("event_date") or event_date
-            key = event_key(data.get("company"), date, ev_type, data.get("stage", ""), data.get("amount_usd", ""))
+            # Coerce and validate before anything is allowed near the sheet. The model
+            # returns valid JSON but not valid values; see validate.py for the specific
+            # failures this catches (enum echoes, "$10M" strings, prose in enum fields).
+            clean, problems = validate_extraction(data)
+            if not is_usable(clean):
+                print("  - rejected: extraction produced no usable company name")
+                if len(processed) >= SAVE_BATCH_SIZE:
+                    flush()
+                time.sleep(MIN_DELAY)
+                continue
+            if problems:
+                for problem in problems:
+                    print(f"  ! {problem}")
+
+            ev_type = clean["event_type"]
+            date = clean["event_date"] or event_date
+            key = funding_event_key(clean["company"], date, ev_type)
             seen_keys.add(key)
-            hq = ", ".join(filter(None, [data.get("hq_city"), data.get("hq_country")]))
-            website = str(data.get("website") or "").rstrip("/")
+            hq = ", ".join(filter(None, [clean["hq_city"], clean["hq_country"]]))
+
+            # Notes carries the evidence note, any hiring prose that was moved out of
+            # the enum column, and the validation problems -- so a bad extraction is
+            # visible in the sheet instead of silent, and the model's failure rate is
+            # measurable over time.
+            notes = " | ".join(filter(None, [
+                clean["evidence_note"],
+                f"hiring note: {clean['hiring_text']}" if clean["hiring_text"] else "",
+                f"data quality: {'; '.join(problems)}" if problems else "",
+            ]))
+
             row = [
-                    date, data.get("company", ""), data.get("stage", "Unknown"), data.get("amount_usd") or "",
-                    data.get("sector", ""), hq, data.get("one_liner", ""),
-                    "B2B" if data.get("is_b2b") else "B2C/Consumer/Unknown", "", "",
-                    data.get("hiring_signal", "Unknown"), website, f"{website}/careers" if website else "",
-                    ", ".join(data.get("founders", []) or []), data.get("lead_investor") or "", item.get("link", ""),
-                    "New", data.get("evidence_note", ""), key,
-                    data.get("broad_offerings", ""), data.get("niche_presence", ""), data.get("product_type", ""),
-                    data.get("target_customers", ""), ", ".join(data.get("other_investors", []) or []),
-                    data.get("valuation_usd") or "", ev_type, item.get("publisher", ""),
-                    data.get("confidence", "Low"), datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+                    date, clean["company"], clean["stage"], clean["amount_usd"] or "",
+                    clean["sector"], hq, clean["one_liner"],
+                    "B2B" if clean["is_b2b"] else "B2C/Consumer/Unknown", "", "",
+                    clean["hiring_flag"], clean["website"],
+                    # Careers URL is left for the ATS enrichment pass to fill with a
+                    # board URL that has actually been fetched. It used to be
+                    # f"{website}/careers" -- a string built by concatenation and never
+                    # verified, which is why this column was 100% populated and 0% real.
+                    "",
+                    ", ".join(clean["founders"]), clean["lead_investor"], item.get("link", ""),
+                    "New", notes, key,
+                    clean["broad_offerings"], clean["niche_presence"], clean["product_type"],
+                    clean["target_customers"], ", ".join(clean["other_investors"]),
+                    clean["valuation_usd"] or "", ev_type, item.get("publisher", ""),
+                    clean["confidence"], datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
                     item.get("published", ""),
             ]
             pending.append(row)
-            print(f"  + {data.get('company')} | {ev_type} | {data.get('sector')} [{data.get('confidence', 'Low')}]" )
+            flag = f" [{len(problems)} data issue(s)]" if problems else ""
+            print(f"  + {clean['company']} | {ev_type} | {clean['stage']} | {clean['sector']} [{clean['confidence']}]{flag}")
         if len(pending) >= SAVE_BATCH_SIZE or len(processed) >= SAVE_BATCH_SIZE:
             flush()
         time.sleep(MIN_DELAY)

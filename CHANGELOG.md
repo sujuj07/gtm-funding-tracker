@@ -50,3 +50,91 @@
 - Improved webhook failure diagnostics and buffering/retry behavior for live and historical crypto ingestion. The historical cursor remains pending if any unresolved model/search/write item remains.
 - Added daily review rechecks for unresolved candidates last checked at least seven days ago. Qualified records are promoted into `Crypto Launch Radar`; the review row is marked promoted. The recheck job does not receive the RootData API key, so it doesn't spend RootData detail credits.
 - Main-sheet launch dates are now written only when the independent evidence review verified an explicit date; DeFiLlama `listedAt` remains a discovery timestamp only.
+
+## v15 — Stop the blank-row corruption; qualify targets on first-party hiring data
+
+### The crash, and why it was getting worse
+`doPost` wrote new rows as two operations: `insertRowsBefore(2, n)` then
+`setValues(...)`. When the script died between them the blank rows were already
+committed and stayed in the sheet. 187 such rows had accumulated.
+
+It was self-worsening. `getNaturalEventRowMap()` read the **whole sheet at full
+width** on every POST (~1,000 rows x 31 columns = ~31,000 cells), `mergeEventRow()`
+did a separate read *and* write per updated row, and every blank row raised
+`lastRow` — so each run read more data, was likelier to hit the execution limit,
+and left more blank rows behind.
+
+- `getNaturalEventRowMap()` now reads only the three columns the key needs, roughly
+  a tenth of the data.
+- The insert is rolled back if the fill fails, so a failed run leaves the sheet
+  unchanged instead of permanently scarred.
+- `applyIntelUpdates()` does two reads and one write regardless of how many rows
+  it touches.
+- New **Tracker Tools > Remove Blank Rows (Funding)** menu item clears the rows
+  already there (deletes in contiguous descending runs so row numbers stay valid).
+
+### Values are validated before they reach the sheet (`validate.py`)
+Groq's `json_object` mode guarantees parseable JSON, never valid *values*. These
+all reached the sheet:
+
+| Observed | Now |
+|---|---|
+| `stage = "Series A\|Series B\|Series C\|..."` (enum echoed) | rejected, re-inferred from source text |
+| `amount_usd = "$10M"` (string, not number) | parsed to 10000000 |
+| `"R$30M"` read as US$30M | converted from BRL (~$5.4M) |
+| `"Rs 43.7 Cr operating revenue"` as a raise | rejected — revenue is not a raise |
+| `hiring_signal = "Staff reduction of 20%"` in an enum column | flag `No`, prose moved to Notes |
+| `website = "N/A"` | discarded |
+| `"Series A"` with `$4B` | kept but flagged as a stage/amount mismatch |
+
+Unparseable amounts stay **empty**. A number recovered from a headline is a guess,
+and a guess does not belong in a column labelled USD. Problems are written to Notes,
+so extraction failures are visible and measurable instead of silent.
+
+### Careers Page column was fabricated
+It was `f"{website}/careers"` — string concatenation, never fetched. That is why the
+column was ~100% populated and ~0% real. `main.py` now leaves it blank; the
+enrichment pass fills `Careers URL (verified)` with a board URL that has actually
+been retrieved.
+
+### Deduplication
+`event_key` hashed `company|date|event_type|stage|amount`, so one raise reported over
+several days by several outlets became several rows — 54 companies occupied 142 rows
+(Griffin's $20M appeared twice, one day apart). `funding_event_key()` keys on
+`company + event_type + month`. Trade-off: two genuine raises in one calendar month
+merge; the Apps Script merge keeps the richer value per field and appends the extra
+source URLs, so nothing is lost when it happens.
+
+### Source Publisher held the search query
+`fetch_google_news` passed `label="Google News: <query>"` and that went straight to the
+sheet. Now the real outlet is read from the entry's `<source>` element (or the
+"- Publisher" title suffix), and the query is kept separately as `discovery_query`.
+
+### Qualification on first-party data (`ats_enrich.py`, `scoring.py`, `enrich_targets.py`)
+Greenhouse, Lever, Ashby, Workable and Recruitee each publish an official keyless
+public JSON board — the same endpoint the employer's own careers page calls. That makes
+three things fact rather than inference: how many roles are open, whether a
+growth/BD/RevOps role is open, and when it was last confirmed.
+
+Scoring weights verified board data above news prose, because an open growth role is
+the company stating the need rather than us guessing it:
+
+    open growth/BD role   +6      small board (1-30)    +3
+    prime stage (seed-A)  +5      raise $1-40M          +4
+    large raise           -4      stage/amount mismatch -3
+
+`None` (not checked) and `0` (checked, none open) are kept distinct — conflating them
+would quietly reward companies nobody has looked at.
+
+New columns are appended from **AF onward**, deliberately beyond the pipeline's
+`maxCol` of 31, so the two writers cannot collide and A:AE never has to be reordered.
+Human outreach columns (POC, status, notes) are never overwritten by automation.
+
+New workflow `enrich-targets.yml` runs twice daily, shares the funding concurrency
+group so it can never write while `fetch.yml` is writing, and is capped per run with
+the queue served highest-score-first.
+
+### Tests
+`tests/test_validate.py` and `tests/test_scoring.py` — 27 cases, every one built from a
+value or ranking failure actually observed in the sheet. Both run in CI before any
+write.

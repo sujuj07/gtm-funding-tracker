@@ -1,0 +1,13 @@
+# Compiled bytecode. The repo currently tracks __pycache__/*.pyc; those stale
+# artifacts can be dropped with:
+#   git rm -r --cached __pycache__ && git commit -m "stop tracking bytecode"
+__pycache__/
+*.py[cod]
+
+# macOS Finder metadata (.DS_Store is currently tracked too)
+.DS_Store
+
+# Local environment
+.env
+.venv/
+venv/
