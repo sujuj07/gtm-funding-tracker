@@ -19,6 +19,7 @@ record a problem note. Never guess, and never silently keep a half-parsed value.
 from __future__ import annotations
 
 import re
+from datetime import datetime, timezone
 from typing import Any
 
 # ---------------------------------------------------------------- enums
@@ -280,6 +281,24 @@ def coerce_hiring(raw: Any) -> tuple[str, str]:
     return "Maybe", text
 
 
+def coerce_int_in_range(raw: Any, low: int, high: int) -> tuple[int | None, str]:
+    """Coerce a bounded integer, rejecting anything outside a plausible range.
+
+    Used for team_size and founded_year. Both are only ever present when the
+    source article states them, so a value outside its range means the model
+    invented or misread it -- in which case None is the honest answer.
+    """
+    if raw is None or raw == "":
+        return None, ""
+    try:
+        value = int(float(str(raw).replace(",", "").strip()))
+    except (TypeError, ValueError):
+        return None, f"could not read an integer from {str(raw)[:40]!r}"
+    if value < low or value > high:
+        return None, f"value {value} outside the plausible range {low}-{high}"
+    return value, ""
+
+
 def coerce_confidence(raw: Any) -> str:
     return _CONF_LOOKUP.get(str(raw or "").strip().lower(), "Low")
 
@@ -372,6 +391,12 @@ def validate_extraction(data: dict) -> tuple[dict, list[str]]:
     if data.get("website") and not website:
         note(f"discarded unusable website value {str(data.get('website'))[:60]!r}")
 
+    team_size, team_note = coerce_int_in_range(data.get("team_size"), 1, 1_000_000)
+    note(team_note)
+    founded_year, founded_note = coerce_int_in_range(
+        data.get("founded_year"), 1800, datetime.now(timezone.utc).year + 1)
+    note(founded_note)
+
     product_type = clean_text(data.get("product_type"), 60).lower()
     if product_type and product_type not in PRODUCT_TYPES:
         note(f"product_type {product_type!r} not in the allowed set")
@@ -398,6 +423,8 @@ def validate_extraction(data: dict) -> tuple[dict, list[str]]:
         "target_customers": clean_text(data.get("target_customers"), 300),
         "hq_city": clean_text(data.get("hq_city"), 120),
         "hq_country": clean_text(data.get("hq_country"), 120),
+        "team_size": team_size,
+        "founded_year": founded_year,
         "confidence": coerce_confidence(data.get("confidence")),
         "evidence_note": clean_text(data.get("evidence_note"), 600),
         "event_date": clean_text(data.get("event_date"), 10),

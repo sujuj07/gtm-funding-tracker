@@ -8,6 +8,7 @@ from tracker_common import (
     fetch_rss_feed, funding_event_key, groq_client, norm_company, parse_event_date, post_rows,
     published_timestamp, webhook_get, excluded_nft_or_meme,
 )
+from scoring import score_clean_row
 from validate import is_usable, validate_extraction
 
 STREAM = "funding"
@@ -68,11 +69,13 @@ PROMPT = r"""You are a careful startup intelligence analyst. Extract ONLY detail
  "founders": ["names if explicitly stated"],
  "lead_investor": "name or null",
  "other_investors": ["names if explicitly stated"],
+ "team_size": number or null,
+ "founded_year": number or null,
  "hiring_signal": "explicit hiring information or Unknown",
  "confidence": "High|Medium|Low",
  "evidence_note": "briefly state what the source actually establishes"
 }
-Relevant means there is a credible reported funding round, explicit company formation/incorporation, or a substantive hiring announcement, AND the company belongs to at least one of these: AI, deep tech (robotics, advanced manufacturing, semiconductors, quantum, biotech tooling, space, energy/climate hardware, scientific instruments, advanced materials), crypto/blockchain/Web3, or fintech. It may be anywhere in the world. Include pre-seed and undisclosed rounds. For crypto/Web3 entries, exclude projects primarily built around NFTs, PFPs, collectibles, NFT marketplaces, meme coins or meme tokens. Exclude fund launches, investor opinions, public-market commentary, token price news, generic product updates without evidence of a new company launch, and unrelated companies. Do not classify a company as NFT/meme-first just because it mentions those as a secondary use case. Keep unsupported fields null/empty/Unknown; never invent a website.
+Relevant means there is a credible reported funding round, explicit company formation/incorporation, or a substantive hiring announcement, AND the company belongs to at least one of these: AI, deep tech (robotics, advanced manufacturing, semiconductors, quantum, biotech tooling, space, energy/climate hardware, scientific instruments, advanced materials), crypto/blockchain/Web3, or fintech. It may be anywhere in the world. Include pre-seed and undisclosed rounds. For crypto/Web3 entries, exclude projects primarily built around NFTs, PFPs, collectibles, NFT marketplaces, meme coins or meme tokens. Exclude fund launches, investor opinions, public-market commentary, token price news, generic product updates without evidence of a new company launch, and unrelated companies. Do not classify a company as NFT/meme-first just because it mentions those as a secondary use case. Keep unsupported fields null/empty/Unknown; never invent a website. For team_size give the company's total employee/headcount ONLY if the source states it explicitly (e.g. "the 12-person team", "grew to 40 staff"); never estimate it from the funding amount, the stage or the company's apparent size. For founded_year give the year the company was founded ONLY if the source states it. Both must be null when the source does not say.
 
 SOURCE TITLE: {title}
 SOURCE DATE: {source_date}
@@ -177,10 +180,16 @@ def main():
                 f"data quality: {'; '.join(problems)}" if problems else "",
             ]))
 
+            # Scored here rather than in a separate pass: every input is already in
+            # `clean`, so each row is scored as it is written and columns I/J (which
+            # had been empty on 536 rows) are populated from the start.
+            gtm_score, gtm_why = score_clean_row(clean, fallback_date=event_date)
+
             row = [
                     date, clean["company"], clean["stage"], clean["amount_usd"] or "",
                     clean["sector"], hq, clean["one_liner"],
-                    "B2B" if clean["is_b2b"] else "B2C/Consumer/Unknown", "", "",
+                    "B2B" if clean["is_b2b"] else "B2C/Consumer/Unknown",
+                    gtm_score, gtm_why,
                     clean["hiring_flag"], clean["website"],
                     # Careers URL is left for the ATS enrichment pass to fill with a
                     # board URL that has actually been fetched. It used to be
@@ -197,7 +206,8 @@ def main():
             ]
             pending.append(row)
             flag = f" [{len(problems)} data issue(s)]" if problems else ""
-            print(f"  + {clean['company']} | {ev_type} | {clean['stage']} | {clean['sector']} [{clean['confidence']}]{flag}")
+            print(f"  + {clean['company']} | {ev_type} | {clean['stage']} | "
+                  f"score={gtm_score} {gtm_why[:60]} [{clean['confidence']}]{flag}")
         if len(pending) >= SAVE_BATCH_SIZE or len(processed) >= SAVE_BATCH_SIZE:
             flush()
         time.sleep(MIN_DELAY)

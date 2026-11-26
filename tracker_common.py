@@ -1481,48 +1481,6 @@ def webhook_get(stream: str, action: str) -> set[str]:
     return set(str(x) for x in values if x)
 
 
-def webhook_get_enrichment_queue(limit: int = 60, max_age_days: int = 14) -> list[dict]:
-    """Fetch the rows that still need an ATS board check.
-
-    Returned highest-score-first by the Apps Script, so a capped run spends its
-    request budget on the most promising targets rather than on sheet order.
-    """
-    response = requests.get(
-        WEBHOOK_URL,
-        params={"token": WEBHOOK_TOKEN, "stream": "funding", "action": "enrichment_queue",
-                "limit": str(limit), "maxAgeDays": str(max_age_days)},
-        timeout=60,
-    )
-    response.raise_for_status()
-    try:
-        data = response.json()
-    except ValueError as exc:
-        raise RuntimeError("Webhook returned non-JSON for enrichment_queue") from exc
-    if not data.get("ok"):
-        raise RuntimeError(f"Webhook GET enrichment_queue failed: {data}")
-    rows = data.get("rows")
-    if not isinstance(rows, list):
-        # ok:true with no 'rows' has exactly one cause: doGet did not recognise the
-        # action and fell through to its generic "webhook live" response, which means
-        # the DEPLOYED script predates enrichment_queue. Saving the Apps Script editor
-        # does not change what the web app serves -- a deployment is pinned to a
-        # numbered version -- so say so here rather than making the next person work
-        # it out from a bare KeyError.
-        raise RuntimeError(
-            "Webhook GET enrichment_queue returned ok but no 'rows', so the deployed "
-            "Apps Script is older than this code and does not know the "
-            "enrichment_queue action.\n"
-            "Fix: paste the current apps_script/Code.gs, save, then "
-            "Deploy > Manage deployments > edit the existing Web app (pencil icon) > "
-            "Version: 'New version' > Deploy. That keeps the same URL. "
-            "'Deploy > New deployment' mints a DIFFERENT URL and leaves WEBHOOK_URL "
-            "pointing at the old code.\n"
-            f"Deployed script version reported: {data.get('scriptVersion') or 'none (pre-v15)'}\n"
-            f"Response was: {str(data)[:300]}"
-        )
-    return [row for row in rows if isinstance(row, dict)]
-
-
 def webhook_get_review_queue() -> list[list[Any]]:
     """Read the visible Crypto Review Queue; errors must not look like an empty queue."""
     response = requests.get(
@@ -1543,19 +1501,15 @@ def webhook_get_review_queue() -> list[list[Any]]:
 def post_rows(
     stream: str, rows: list[list[Any]], processed_sources: list[str] | None = None, *,
     allow_reprocessed_sources: bool = False, review_rows: list[list[Any]] | None = None,
-    intel_updates: list[dict] | None = None,
 ) -> dict | None:
     review_rows = review_rows or []
-    intel_updates = intel_updates or []
-    if not rows and not processed_sources and not review_rows and not intel_updates:
-        return {"ok": True, "appended": 0, "updated": 0, "reviewAppended": 0, "reviewUpdated": 0,
-                "intelApplied": 0, "skipped": 0}
+    if not rows and not processed_sources and not review_rows:
+        return {"ok": True, "appended": 0, "updated": 0, "reviewAppended": 0, "reviewUpdated": 0, "skipped": 0}
     try:
         response = requests.post(
             WEBHOOK_URL,
             json={"token": WEBHOOK_TOKEN, "stream": stream, "rows": rows,
                   "reviewRows": review_rows,
-                  "intelUpdates": intel_updates,
                   "processedSources": processed_sources or [],
                   "allowReprocessedSources": bool(allow_reprocessed_sources)},
             timeout=90,

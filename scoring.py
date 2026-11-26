@@ -1,58 +1,60 @@
 """Score how worth reaching out to a company is, for a growth/BD/RevOps job hunt.
 
-The target profile is specific: a company that has raised recently, is still
-small enough not to have a commercial team, and therefore needs someone to build
-revenue operations. Funding alone is a weak proxy for that. The number of open
-roles on the company's own job board is a much better one, and an *open
-growth/BD role* is not a proxy at all -- it is the company stating the need.
+Scored from the row itself at write time, so every row gets a score as it is
+created. There is no second pass, no queue and no extra workflow: the inputs are
+all fields the extraction already produces.
 
-So the weights deliberately put verified board data above news-derived fields:
+Target profile: raised recently, still small enough to have no commercial team,
+and therefore likely to need someone to build revenue operations.
 
-  open growth/BD role   +6   they are hiring this job, right now
-  small board (1-30)    +3   thin team, so the role has real scope
-  prime stage           +5   seed / Series A, the window before a GTM team exists
-  raise $1-40M          +4   enough money to hire, too little to already have staff
-  large raise           -4   probably already has a commercial org
-  stage/amount mismatch -3   the data contradicts itself; do not trust the row
+Honest limits on the inputs
+---------------------------
+`team_size` and `founded_year` are only ever populated when the *source article
+states them*. That is uncommon -- most funding stories never mention headcount --
+so expect these to be empty on the majority of rows. They are scored generously
+when present and simply absent otherwise; a missing value is never guessed, and
+never treated as "small".
 
-Scores are only as good as their inputs, so every component records a tag. A row
-scoring 18 with `AMT?` in its signals is a different proposition from one scoring
-18 on verified numbers, and the tags make that visible instead of burying it.
+Where a signal is absent, stage and raise size act as the fallback proxy. They
+are weaker: a Seed round usually means a small team, but "usually" is doing real
+work in that sentence. The `Why Fit` string names which signals actually fired,
+so a score built on a stated headcount is distinguishable from one built on
+stage alone.
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 
-# Stage -> points. The "prime hiring window" is the stretch where a company has
-# money and customers but no commercial team yet.
+# Stage -> points. The "prime window" is after a company has money and customers
+# but before it has a commercial team.
 STAGE_POINTS = {
     "Seed": 5,
     "Seed Extension": 5,
     "Series A": 5,
     "Bridge": 4,
-    "Pre-seed": 3,
+    "Pre-seed": 4,
     "Series B": 2,
+    "Grant": 1,
     "Debt": 1,
     "Unknown": 1,
     "Series C": 0,
     "Series D+": 0,
     "Growth": 0,
     "Strategic": 0,
-    "Grant": 1,
 }
 
 AMOUNT_FLOOR = 1_000_000
 AMOUNT_CEILING = 40_000_000
 
-# A board this large means an established company with an existing GTM function.
-BOARD_LARGE = 100
-BOARD_SMALL = 30
+SMALL_TEAM = 10          # the threshold worth flagging explicitly
+MEDIUM_TEAM = 50
+LARGE_TEAM = 200
+NEW_COMPANY_YEARS = 3
 
-TIER_BOUNDS = ((18, "A"), (13, "B"), (8, "C"))
+TIER_BOUNDS = ((16, "A"), (12, "B"), (8, "C"))
 
 
 def _days_since(value: str) -> int | None:
-    """Days between an ISO date string and today, or None if unparseable."""
     text = (value or "").strip()[:10]
     if not text:
         return None
@@ -75,60 +77,62 @@ def score_row(
     stage: str = "",
     amount_usd: float | None = None,
     event_date: str = "",
-    customer_type: str = "",
+    is_b2b: bool = False,
     hiring_flag: str = "",
     event_type: str = "",
-    ats_platform: str = "",
-    open_roles: int | None = None,
-    target_roles: int | None = None,
+    team_size: int | None = None,
+    founded_year: int | None = None,
 ) -> tuple[int, str, str]:
-    """Score one company.
+    """Score one row.
 
-    Returns ``(score, tier, signals)``. ``signals`` is a compact tag string so
-    the sheet shows *why* a row ranks where it does, e.g.
-    ``GROWTH-ROLE-OPEN · SMALL-TEAM · PRIME-STAGE · $1-40M · B2B · FRESH``.
-
-    ``open_roles``/``target_roles`` of None mean "not checked yet", which is
-    scored differently from 0 ("checked, none open"). Treating those the same
-    would quietly reward companies that have never been looked at.
+    Returns ``(score, tier, why)``. ``why`` is a compact tag string written to the
+    GTM Fit Reason column, e.g.
+    ``SMALL-TEAM(8) · NEW-CO(2025) · PRIME-STAGE · $1-40M · HIRING · B2B · FRESH``
+    so the sheet shows which signals fired rather than just a number.
     """
     score = 0
     tags: list[str] = []
 
-    # An entry that is not a funding event is not a target for this purpose.
-    if event_type and event_type not in ("Funding round", "Debt", ""):
+    # Acquisitions, exec changes and the like are not outreach targets. A newly
+    # incorporated company IS kept, because "is this a new company" is a signal
+    # worth seeing -- it just scores low on its own, having no raise behind it.
+    SCORABLE = ("Funding round", "Debt", "Company formation/incorporation", "")
+    if event_type and event_type not in SCORABLE:
         return 0, "D", "NOT-A-FUNDING-EVENT"
 
-    # --- the strongest signal: a growth-shaped role is actually open ---
-    if target_roles:
-        score += 6
-        tags.append(f"GROWTH-ROLE-OPEN x{target_roles}" if target_roles > 1 else "GROWTH-ROLE-OPEN")
-        if target_roles > 1:
-            score += 1
-    elif target_roles == 0 and ats_platform:
-        tags.append("no-growth-role-open")
-
-    # --- team size, from the board rather than from prose ---
-    if open_roles is not None:
-        if 1 <= open_roles <= BOARD_SMALL:
-            score += 3
-            tags.append(f"SMALL-TEAM ({open_roles} roles)")
-        elif open_roles > BOARD_LARGE:
+    # --- team size: the signal that matters most, when the source states it ---
+    if team_size is not None:
+        if team_size <= SMALL_TEAM:
+            score += 5
+            tags.append(f"SMALL-TEAM({team_size})")
+        elif team_size <= MEDIUM_TEAM:
+            score += 2
+            tags.append(f"team {team_size}")
+        elif team_size >= LARGE_TEAM:
             score -= 3
-            tags.append(f"LARGE-ORG ({open_roles} roles)")
-        elif open_roles > BOARD_SMALL:
-            tags.append(f"{open_roles} roles open")
-    if ats_platform:
-        score += 1
-        tags.append(ats_platform)
+            tags.append(f"LARGE-ORG({team_size})")
+        else:
+            tags.append(f"team {team_size}")
 
-    # --- stage ---
+    # --- new company ---
+    this_year = datetime.now(timezone.utc).year
+    if founded_year and (this_year - founded_year) <= NEW_COMPANY_YEARS:
+        score += 3
+        tags.append(f"NEW-CO({founded_year})")
+    if event_type == "Company formation/incorporation":
+        score += 2
+        tags.append("JUST-INCORPORATED")
+
+    # --- stage: the fallback proxy for team size when headcount is unknown ---
     stage_points = STAGE_POINTS.get(stage, 1)
     score += stage_points
     if stage_points >= 5:
         tags.append("PRIME-STAGE")
     elif stage and stage != "Unknown":
         tags.append(stage)
+    if team_size is None and stage_points >= 4:
+        # Be explicit that smallness is inferred here, not established.
+        tags.append("team-size-unknown")
 
     # --- raise size ---
     if amount_usd:
@@ -147,20 +151,18 @@ def score_row(
     else:
         tags.append("AMT?")
 
-    # --- news-derived hiring hint: kept, but worth far less than the board ---
-    if not ats_platform:
-        if hiring_flag == "Yes":
-            score += 2
-            tags.append("hiring (news)")
-        elif hiring_flag == "Maybe":
-            score += 1
+    # --- hiring mention in the source ---
+    if hiring_flag == "Yes":
+        score += 3
+        tags.append("HIRING")
+    elif hiring_flag == "Maybe":
+        score += 1
     elif hiring_flag == "No":
-        # A layoff report outweighs an open board.
         score -= 3
         tags.append("LAYOFF-REPORTED")
 
     # --- fit and freshness ---
-    if customer_type == "B2B":
+    if is_b2b:
         score += 2
         tags.append("B2B")
 
@@ -179,45 +181,20 @@ def score_row(
     return score, tier_for(score), " · ".join(tags)
 
 
-def score_queue_row(row: dict, enrichment: dict | None = None) -> dict:
-    """Score one enrichment-queue row and shape it for the webhook.
+def score_clean_row(clean: dict, fallback_date: str = "") -> tuple[int, str]:
+    """Score a validated extraction, returning ``(score, why)`` for columns I and J.
 
-    Returns a dict ready to be posted in ``intelUpdates``. Human-entered outreach
-    columns are intentionally absent so the webhook cannot overwrite them.
+    Tier is folded into ``why`` rather than taking a third column, so this fits the
+    two columns the sheet already has instead of adding more.
     """
-    enrichment = enrichment or {}
-
-    def as_int(value):
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
-
-    open_roles = as_int(enrichment.get("open_roles"))
-    target_roles = as_int(enrichment.get("target_roles"))
-
-    score, tier, signals = score_row(
-        stage=row.get("stage") or "",
-        amount_usd=row.get("amount") or None,
-        event_date=row.get("date") or "",
-        customer_type=row.get("customerType") or "",
-        hiring_flag=row.get("hiringFlag") or "",
-        event_type=row.get("eventType") or "",
-        ats_platform=enrichment.get("platform") or "",
-        open_roles=open_roles,
-        target_roles=target_roles,
+    score, tier, why = score_row(
+        stage=clean.get("stage") or "",
+        amount_usd=clean.get("amount_usd") or None,
+        event_date=clean.get("event_date") or fallback_date,
+        is_b2b=bool(clean.get("is_b2b")),
+        hiring_flag=clean.get("hiring_flag") or "",
+        event_type=clean.get("event_type") or "",
+        team_size=clean.get("team_size"),
+        founded_year=clean.get("founded_year"),
     )
-
-    return {
-        "key": row.get("key"),
-        "targetScore": score,
-        "tier": tier,
-        "signals": signals,
-        "atsPlatform": enrichment.get("platform", ""),
-        "atsSlug": enrichment.get("slug", ""),
-        "careersUrl": enrichment.get("board_url", ""),
-        "openRoles": "" if open_roles is None else open_roles,
-        "targetRoles": "" if target_roles is None else target_roles,
-        "targetTitles": enrichment.get("target_titles", ""),
-        "rolesChecked": enrichment.get("checked_at", ""),
-    }
+    return score, f"[{tier}] {why}" if why else f"[{tier}]"

@@ -8,7 +8,7 @@ const SECRET_TOKEN = 'REPLACE_WITH_A_NEW_LONG_RANDOM_SECRET';
 // version the web app is actually SERVING -- saving the editor does not change that,
 // because a deployment is pinned to a numbered version. Mismatch here is the first
 // thing to check when the pipeline behaves like older code.
-const SCRIPT_VERSION = 'v15';
+const SCRIPT_VERSION = 'v16';
 const FUNDING_SHEET_NAME = 'Funding Intelligence';
 const CRYPTO_SHEET_NAME = 'Crypto Launch Radar';
 const REGISTRY_SHEET_NAME = '__ProcessedSources';
@@ -211,139 +211,6 @@ const STREAMS = {
   funding: { sheetName: FUNDING_SHEET_NAME, companyCol: 2, sourceCol: 16, keyCol: 19, additionalSourcesCol: 31, lastCheckedCol: 29, eventTypeCol: 26, maxCol: 31 },
   crypto: { sheetName: CRYPTO_SHEET_NAME, companyCol: 2, sourceCol: 13, keyCol: 18, additionalSourcesCol: 20, lastCheckedCol: 17, maxCol: 28 },
 };
-
-/**
- * Intelligence columns, appended AFTER the 31 columns the funding pipeline owns.
- *
- * Deliberately placed beyond maxCol (31) so the two writers never collide: the
- * funding pipeline writes A:AE by position and is unaware of these, while the
- * enrichment pass writes only this block. Reordering A:AE would break the
- * pipeline, so nothing here touches it.
- */
-const INTEL_START_COL = 32; // AF
-const INTEL_FIELDS = [
-  'Target Score',        // AF
-  'Tier',                // AG
-  'Signals',             // AH
-  'ATS Platform',        // AI
-  'ATS Board Slug',      // AJ
-  'Careers URL (verified)', // AK
-  'Open Roles',          // AL
-  'Growth/BD Roles Open',// AM
-  'Growth/BD Role Titles',  // AN
-  'Roles Last Checked',  // AO
-  'POC Name',            // AP
-  'POC Title',           // AQ
-  'POC Contact',         // AR
-  'Outreach Status',     // AS
-  'Outreach Date',       // AT
-  'Outreach Notes'       // AU
-];
-// Field name -> offset within the block. Keep in step with INTEL_FIELDS.
-const INTEL_OFFSET = {
-  targetScore: 0, tier: 1, signals: 2, atsPlatform: 3, atsSlug: 4,
-  careersUrl: 5, openRoles: 6, targetRoles: 7, targetTitles: 8, rolesChecked: 9,
-  pocName: 10, pocTitle: 11, pocContact: 12,
-  outreachStatus: 13, outreachDate: 14, outreachNotes: 15
-};
-// Columns a human edits. The enrichment pass must never overwrite these.
-const INTEL_HUMAN_FIELDS = ['pocName', 'pocTitle', 'pocContact', 'outreachStatus', 'outreachDate', 'outreachNotes'];
-
-function ensureIntelHeaders(sheet) {
-  const needed = INTEL_START_COL + INTEL_FIELDS.length - 1;
-  if (sheet.getMaxColumns() < needed) {
-    sheet.insertColumnsAfter(sheet.getMaxColumns(), needed - sheet.getMaxColumns());
-  }
-  sheet.getRange(1, INTEL_START_COL, 1, INTEL_FIELDS.length).setValues([INTEL_FIELDS]);
-}
-
-/**
- * Rows that still need an ATS lookup: a website is known, and the board has
- * either never been checked or was checked longer ago than maxAgeDays.
- */
-function getEnrichmentQueue(sheet, limit, maxAgeDays) {
-  const config = STREAMS.funding;
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 2) return [];
-  const count = lastRow - 1;
-
-  // One read of A:AE, then the intel block. The scoring inputs (stage, amount,
-  // date, customer type, hiring flag) travel with the queue so the runner can
-  // score without a second round trip per row.
-  const core = sheet.getRange(2, 1, count, config.maxCol).getValues();
-  const checked = sheet.getRange(2, INTEL_START_COL + INTEL_OFFSET.rolesChecked, count, 1).getValues();
-  const scores = sheet.getRange(2, INTEL_START_COL + INTEL_OFFSET.targetScore, count, 1).getValues();
-
-  const cutoff = Date.now() - (maxAgeDays * 86400000);
-  const queue = [];
-  for (let i = 0; i < count; i++) {
-    const row = core[i];
-    const company = String(row[config.companyCol - 1] || '').trim();
-    const website = String(row[11] || '').trim();   // L: Website
-    const key = String(row[config.keyCol - 1] || '').trim();
-    if (!company || !website || !key) continue;
-    const last = String(checked[i][0] || '').trim();
-    if (last) {
-      const when = Date.parse(last.replace(' UTC', 'Z').replace(' ', 'T'));
-      if (!isNaN(when) && when > cutoff) continue;
-    }
-    queue.push({
-      key: key, company: company, website: website,
-      stage: String(row[2] || ''),
-      amount: row[3] === '' || row[3] === null ? null : Number(row[3]) || null,
-      date: dateKey(row[0]),
-      customerType: String(row[7] || ''),
-      hiringFlag: String(row[10] || ''),
-      eventType: String(row[config.eventTypeCol - 1] || ''),
-      score: Number(scores[i][0]) || 0,
-      lastChecked: last
-    });
-  }
-  // Highest-scoring first, so a capped run spends its budget on the best targets.
-  queue.sort(function (a, b) { return b.score - a.score; });
-  return queue.slice(0, limit);
-}
-
-/**
- * Applies enrichment + scoring results, matched by dedupe key.
- *
- * Two reads and ONE write regardless of how many rows are updated. Matching on
- * the key rather than a row number matters because new rows are inserted at
- * row 2, so any row number the caller saw earlier may already have shifted.
- * Human-entered outreach columns are never touched.
- */
-function applyIntelUpdates(sheet, updates) {
-  if (!Array.isArray(updates) || !updates.length) return 0;
-  const config = STREAMS.funding;
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 2) return 0;
-  const count = lastRow - 1;
-  const width = INTEL_FIELDS.length;
-
-  const keys = sheet.getRange(2, config.keyCol, count, 1).getValues();
-  const rowByKey = {};
-  for (let i = 0; i < count; i++) {
-    const key = String(keys[i][0] || '').trim();
-    if (key && rowByKey[key] === undefined) rowByKey[key] = i;
-  }
-
-  const block = sheet.getRange(2, INTEL_START_COL, count, width).getValues();
-  let applied = 0;
-  updates.forEach(function (update) {
-    const index = rowByKey[String(update.key || '').trim()];
-    if (index === undefined) return;
-    Object.keys(INTEL_OFFSET).forEach(function (field) {
-      if (INTEL_HUMAN_FIELDS.indexOf(field) >= 0) return; // never clobber human edits
-      const value = update[field];
-      if (value === undefined || value === null) return;
-      block[index][INTEL_OFFSET[field]] = value;
-    });
-    applied++;
-  });
-
-  if (applied) sheet.getRange(2, INTEL_START_COL, count, width).setValues(block);
-  return applied;
-}
 
 function normalizeCompany(name) {
   return String(name || '').toLowerCase()
@@ -658,8 +525,6 @@ function doPost(e) {
     const naturalRows = getNaturalEventRowMap(stream, sheet);
     const rows = Array.isArray(body.rows) ? body.rows : [];
     const reviewRows = Array.isArray(body.reviewRows) ? body.reviewRows : [];
-    const intelUpdates = Array.isArray(body.intelUpdates) ? body.intelUpdates : [];
-    if (intelUpdates.length && stream !== 'funding') throw new Error('intelUpdates are only valid for stream=funding');
     if (reviewRows.length && stream !== 'crypto') throw new Error('reviewRows are only valid for stream=crypto');
     const batchSources = {};
     const batchKeys = {};
@@ -730,14 +595,6 @@ function doPost(e) {
     // the request returns ok:false and the Python backfill keeps the entire batch retryable.
     const reviewResult = reviewRows.length ? upsertCryptoReviewRows(reviewRows) : { appended: 0, updated: 0 };
 
-    // Enrichment/scoring block. Applied after the row inserts above so a brand-new
-    // row can be scored in the same request that created it.
-    let intelApplied = 0;
-    if (intelUpdates.length) {
-      ensureIntelHeaders(sheet);
-      intelApplied = applyIntelUpdates(sheet, intelUpdates);
-    }
-
     // Apply the crypto presentation after inserts/updates so newly added rows match the table style.
     formatTrackerSheet(sheet, stream, toAdd.length);
 
@@ -749,7 +606,6 @@ function doPost(e) {
     recordProcessedSources(stream, processed);
     return jsonOut({ ok: true, stream: stream, appended: toAdd.length, updated: toUpdate.length,
       reviewAppended: reviewResult.appended, reviewUpdated: reviewResult.updated,
-      intelApplied: intelApplied,
       skipped: skipped, processed: processed.length });
   } catch (err) {
     return jsonOut({ ok: false, error: String(err) });
@@ -767,15 +623,6 @@ function doGet(e) {
     const action = params.action || 'health';
     const sheet = getSheetForStream(stream);
     if (action === 'health' || action === 'format') formatTrackerSheet(sheet, stream);
-    if (action === 'enrichment_queue') {
-      if (stream !== 'funding') return jsonOut({ ok: false, error: 'enrichment_queue requires stream=funding' });
-      ensureIntelHeaders(sheet);
-      const limit = Math.min(Math.max(parseInt(params.limit, 10) || 60, 1), 400);
-      const maxAgeDays = Math.max(parseInt(params.maxAgeDays, 10) || 14, 0);
-      const queue = getEnrichmentQueue(sheet, limit, maxAgeDays);
-      return jsonOut({ ok: true, scriptVersion: SCRIPT_VERSION, stream: stream,
-                       rows: queue, count: queue.length });
-    }
     if (action === 'existing_sources') return jsonOut({ ok: true, stream: stream, sources: getExistingSources(stream, sheet) });
     if (action === 'existing_keys') return jsonOut({ ok: true, stream: stream, keys: getExistingKeys(stream, sheet) });
     if (action === 'existing_companies') {
@@ -804,7 +651,7 @@ function doGet(e) {
       message: action === 'format' ? 'sheet formatting applied' : 'webhook live',
       stream: stream, sheet: sheet.getName(),
       knownActions: ['health', 'format', 'existing_sources', 'existing_keys',
-                     'existing_companies', 'enrichment_queue', 'review_queue'] });
+                     'existing_companies', 'review_queue'] });
   } catch (err) {
     return jsonOut({ ok: false, error: String(err) });
   }

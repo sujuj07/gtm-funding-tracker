@@ -10,10 +10,12 @@ import math
 from datetime import datetime, timedelta, timezone
 
 from tracker_common import (
-    MODEL_CHAIN_LABEL, defillama_raises, event_key, extract_json, fetch_google_news,
+    MODEL_CHAIN_LABEL, defillama_raises, extract_json, fetch_google_news, funding_event_key,
     groq_client, post_rows, webhook_get, norm_company, parse_event_date, published_timestamp,
     excluded_nft_or_meme,
 )
+from scoring import score_clean_row
+from validate import is_usable, validate_extraction
 from backfill_state import advance_window, choose_window, end_exclusive_today, leave_window_pending
 
 STREAM = "funding"
@@ -68,6 +70,8 @@ PROMPT = r"""You are a careful startup intelligence analyst. Extract ONLY detail
  "founders": ["names only if stated"],
  "lead_investor": "name or null",
  "other_investors": ["names only if stated"],
+ "team_size": number or null,
+ "founded_year": number or null,
  "hiring_signal": "explicit hiring information or Unknown",
  "confidence": "High|Medium|Low",
  "evidence_note": "what this source establishes"
@@ -183,24 +187,46 @@ def main():
             if excluded_nft_or_meme(data):
                 print(f"  - excluded NFT/meme-first project: {data.get('company')}")
             else:
-                event_type = data.get("event_type") or "Funding round"
-                event_date = data.get("event_date") or date
-                key = event_key(data.get("company"), event_date, event_type, data.get("stage", ""), data.get("amount_usd", ""))
+                # Same validation path as main.py. This is a second writer into the
+                # same sheet, so skipping it here would leave half the rows
+                # unvalidated -- enum echoes, "$10M" strings and prose in the
+                # hiring column all came through here too.
+                clean, problems = validate_extraction(data)
+                if not is_usable(clean):
+                    print("  - rejected: extraction produced no usable company name")
+                    continue
+                for problem in problems:
+                    print(f"  ! {problem}")
+
+                event_type = clean["event_type"]
+                event_date = clean["event_date"] or date
+                key = funding_event_key(clean["company"], event_date, event_type)
                 seen_keys.add(key)
-                hq = ", ".join(filter(None, [data.get("hq_city"), data.get("hq_country")]))
-                website = str(data.get("website") or "").rstrip("/")
+                hq = ", ".join(filter(None, [clean["hq_city"], clean["hq_country"]]))
+                gtm_score, gtm_why = score_clean_row(clean, fallback_date=date)
+                notes = " | ".join(filter(None, [
+                    clean["evidence_note"],
+                    f"hiring note: {clean['hiring_text']}" if clean["hiring_text"] else "",
+                    f"data quality: {'; '.join(problems)}" if problems else "",
+                ]))
                 pending.append([
-                    event_date, data.get("company", ""), data.get("stage", "Unknown"), data.get("amount_usd") or "",
-                    data.get("sector", ""), hq, data.get("one_liner", ""),
-                    "B2B" if data.get("is_b2b") else "B2C/Consumer/Unknown", "", "", data.get("hiring_signal", "Unknown"),
-                    website, f"{website}/careers" if website else "", ", ".join(data.get("founders", []) or []),
-                    data.get("lead_investor") or "", item.get("link", ""), "New", data.get("evidence_note", ""), key,
-                    data.get("broad_offerings", ""), data.get("niche_presence", ""), data.get("product_type", ""),
-                    data.get("target_customers", ""), ", ".join(data.get("other_investors", []) or []), data.get("valuation_usd") or "",
-                    event_type, item.get("publisher", ""), data.get("confidence", "Low"),
+                    event_date, clean["company"], clean["stage"], clean["amount_usd"] or "",
+                    clean["sector"], hq, clean["one_liner"],
+                    "B2B" if clean["is_b2b"] else "B2C/Consumer/Unknown",
+                    gtm_score, gtm_why, clean["hiring_flag"],
+                    # Careers URL stays blank rather than website + "/careers", which
+                    # was never fetched and so was never a real URL.
+                    clean["website"], "", ", ".join(clean["founders"]),
+                    clean["lead_investor"], item.get("link", ""), "New", notes, key,
+                    clean["broad_offerings"], clean["niche_presence"], clean["product_type"],
+                    clean["target_customers"], ", ".join(clean["other_investors"]),
+                    clean["valuation_usd"] or "",
+                    event_type, item.get("publisher", ""), clean["confidence"],
                     datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), item.get("published", ""),
                 ])
-                print(f"  + {data.get('company')} | {event_type} | {data.get('sector')}")
+                flag = f" [{len(problems)} data issue(s)]" if problems else ""
+                print(f"  + {clean['company']} | {event_type} | {clean['stage']} | "
+                      f"score={gtm_score} {gtm_why[:50]}{flag}")
         if len(pending) >= SAVE_BATCH_SIZE or len(processed) >= SAVE_BATCH_SIZE:
             flush()
         time.sleep(DELAY)

@@ -138,3 +138,45 @@ the queue served highest-score-first.
 `tests/test_validate.py` and `tests/test_scoring.py` — 27 cases, every one built from a
 value or ranking failure actually observed in the sheet. Both run in CI before any
 write.
+
+## v16 — Remove the ATS enrichment; score from the row itself
+
+The ATS board enrichment added in v15 is removed. It was unproven against real
+sites, and it introduced a second workflow, a webhook action, 16 appended sheet
+columns and ~820 lines of code to answer one question — how big is this team.
+
+Deleted: `ats_enrich.py`, `enrich_targets.py`, `.github/workflows/enrich-targets.yml`,
+the `enrichment_queue` GET action, `applyIntelUpdates`, the INTEL column block, and
+`webhook_get_enrichment_queue` / `post_rows(intel_updates=...)`. Sheet columns AF:AU
+removed. `Code.gs` is down from 811 to 658 lines.
+
+Everything in v15 that fixed an actual bug is untouched: the blank-row rollback,
+the narrowed sheet read, `cleanupBlankFundingRows`, `validate.py`, the month-bucket
+dedupe key, and the publisher fix.
+
+### Scoring moved into the write path
+Scoring now runs in `scoring.py` at row-write time and fills **columns I and J**
+(`GTM Fit Score` / `GTM Fit Reason`), which already existed and had been empty on 536
+rows. No second pass, no queue, no new columns.
+
+Signals: stated team size, stated founding year, stage, raise band, hiring mention,
+B2B, freshness. Each one that fires is named in column J, e.g.
+`[A] SMALL-TEAM(9) · NEW-CO(2025) · PRIME-STAGE · $1-40M · HIRING · B2B · FRESH`.
+
+### Team size and founding year
+`team_size` and `founded_year` were added to the extraction schema, with the prompt
+instructing the model to return them **only when the source states them outright** and
+never to estimate from the raise or the stage. Both are range-checked.
+
+Expect them to be empty on most rows: funding articles rarely print headcount. When
+headcount is unknown the score falls back to stage as a proxy and column J says
+`team-size-unknown`, so an inferred "small" is distinguishable from a stated one.
+This is a partial answer to "under 10 team members" — an honest one, not a guessed one.
+
+### backfill.py had every bug main.py had
+`backfill-funding-intelligence` is an active workflow writing to the same sheet, and it
+was still building rows the old way: unvalidated stage and amount, prose in the hiring
+column, the fabricated `website + "/careers"` value, and empty score columns. It now
+runs the same `validate_extraction` + `score_clean_row` path as `main.py`, and its
+dedupe key matches too (it was still using `event_key` with stage and amount, so
+backfill rows carried a different key format than live rows).
