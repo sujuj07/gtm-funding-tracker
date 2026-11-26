@@ -1502,7 +1502,24 @@ def webhook_get_enrichment_queue(limit: int = 60, max_age_days: int = 14) -> lis
         raise RuntimeError(f"Webhook GET enrichment_queue failed: {data}")
     rows = data.get("rows")
     if not isinstance(rows, list):
-        raise RuntimeError("Webhook response missing 'rows' for enrichment_queue")
+        # ok:true with no 'rows' has exactly one cause: doGet did not recognise the
+        # action and fell through to its generic "webhook live" response, which means
+        # the DEPLOYED script predates enrichment_queue. Saving the Apps Script editor
+        # does not change what the web app serves -- a deployment is pinned to a
+        # numbered version -- so say so here rather than making the next person work
+        # it out from a bare KeyError.
+        raise RuntimeError(
+            "Webhook GET enrichment_queue returned ok but no 'rows', so the deployed "
+            "Apps Script is older than this code and does not know the "
+            "enrichment_queue action.\n"
+            "Fix: paste the current apps_script/Code.gs, save, then "
+            "Deploy > Manage deployments > edit the existing Web app (pencil icon) > "
+            "Version: 'New version' > Deploy. That keeps the same URL. "
+            "'Deploy > New deployment' mints a DIFFERENT URL and leaves WEBHOOK_URL "
+            "pointing at the old code.\n"
+            f"Deployed script version reported: {data.get('scriptVersion') or 'none (pre-v15)'}\n"
+            f"Response was: {str(data)[:300]}"
+        )
     return [row for row in rows if isinstance(row, dict)]
 
 

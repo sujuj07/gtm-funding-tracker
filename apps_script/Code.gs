@@ -4,6 +4,11 @@
  * Set the same new secret in this file and the GitHub WEBHOOK_TOKEN secret.
  */
 const SECRET_TOKEN = 'REPLACE_WITH_A_NEW_LONG_RANDOM_SECRET';
+// Bump when this file changes. Returned by the health GET so you can confirm which
+// version the web app is actually SERVING -- saving the editor does not change that,
+// because a deployment is pinned to a numbered version. Mismatch here is the first
+// thing to check when the pipeline behaves like older code.
+const SCRIPT_VERSION = 'v15';
 const FUNDING_SHEET_NAME = 'Funding Intelligence';
 const CRYPTO_SHEET_NAME = 'Crypto Launch Radar';
 const REGISTRY_SHEET_NAME = '__ProcessedSources';
@@ -768,7 +773,8 @@ function doGet(e) {
       const limit = Math.min(Math.max(parseInt(params.limit, 10) || 60, 1), 400);
       const maxAgeDays = Math.max(parseInt(params.maxAgeDays, 10) || 14, 0);
       const queue = getEnrichmentQueue(sheet, limit, maxAgeDays);
-      return jsonOut({ ok: true, stream: stream, rows: queue, count: queue.length });
+      return jsonOut({ ok: true, scriptVersion: SCRIPT_VERSION, stream: stream,
+                       rows: queue, count: queue.length });
     }
     if (action === 'existing_sources') return jsonOut({ ok: true, stream: stream, sources: getExistingSources(stream, sheet) });
     if (action === 'existing_keys') return jsonOut({ ok: true, stream: stream, keys: getExistingKeys(stream, sheet) });
@@ -794,7 +800,11 @@ function doGet(e) {
       });
       return jsonOut({ ok: true, stream: stream, rows: unresolved });
     }
-    return jsonOut({ ok: true, message: action === 'format' ? 'sheet formatting applied' : 'webhook live', stream: stream, sheet: sheet.getName() });
+    return jsonOut({ ok: true, scriptVersion: SCRIPT_VERSION,
+      message: action === 'format' ? 'sheet formatting applied' : 'webhook live',
+      stream: stream, sheet: sheet.getName(),
+      knownActions: ['health', 'format', 'existing_sources', 'existing_keys',
+                     'existing_companies', 'enrichment_queue', 'review_queue'] });
   } catch (err) {
     return jsonOut({ ok: false, error: String(err) });
   }
