@@ -12,9 +12,61 @@ const REGISTRY_SHEET_NAME = '__ProcessedSources';
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('Tracker Tools')
+    .addItem('Remove Blank Rows (Funding)', 'cleanupBlankFundingRows')
+    .addSeparator()
     .addItem('Format Crypto Launch Radar', 'formatCryptoLaunchRadar')
     .addItem('Format Crypto Review Queue', 'formatCryptoReviewQueue')
     .addToUi();
+}
+
+/**
+ * Deletes rows that have neither a company name nor a source URL.
+ *
+ * These are the residue of the insert-then-fill bug above: insertRowsBefore
+ * committed the rows, the fill never completed. They are not merely cosmetic --
+ * each one inflates lastRow, so every subsequent run reads more data and is more
+ * likely to time out, creating more of them.
+ *
+ * Deletes in contiguous descending runs so earlier deletions cannot shift the
+ * row numbers of rows still queued for deletion.
+ */
+function cleanupBlankFundingRows() {
+  const stream = 'funding';
+  const config = STREAMS[stream];
+  const sheet = getSheetForStream(stream);
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+  const count = lastRow - 1;
+
+  const companies = sheet.getRange(2, config.companyCol, count, 1).getValues();
+  const sources = sheet.getRange(2, config.sourceCol, count, 1).getValues();
+
+  // Descending, so index arithmetic during deletion stays valid.
+  const blanks = [];
+  for (let i = count - 1; i >= 0; i--) {
+    const company = String(companies[i][0] || '').trim();
+    const source = String(sources[i][0] || '').trim();
+    if (!company && !source) blanks.push(i + 2);
+  }
+
+  let removed = 0;
+  let i = 0;
+  while (i < blanks.length) {
+    const start = blanks[i];
+    let run = 1;
+    while (i + run < blanks.length && blanks[i + run] === start - run) run++;
+    sheet.deleteRows(start - run + 1, run);
+    removed += run;
+    i += run;
+  }
+  SpreadsheetApp.flush();
+  try {
+    SpreadsheetApp.getActiveSpreadsheet()
+      .toast('Removed ' + removed + ' blank row(s).', 'Tracker Tools', 6);
+  } catch (ignored) {
+    // Running headless (no UI bound); the return value is the result.
+  }
+  return removed;
 }
 
 function formatCryptoLaunchRadar() {
@@ -151,9 +203,142 @@ function upsertCryptoReviewRows(rows) {
 
 
 const STREAMS = {
-  funding: { sheetName: FUNDING_SHEET_NAME, companyCol: 2, sourceCol: 16, keyCol: 19, additionalSourcesCol: 31, lastCheckedCol: 29, maxCol: 31 },
+  funding: { sheetName: FUNDING_SHEET_NAME, companyCol: 2, sourceCol: 16, keyCol: 19, additionalSourcesCol: 31, lastCheckedCol: 29, eventTypeCol: 26, maxCol: 31 },
   crypto: { sheetName: CRYPTO_SHEET_NAME, companyCol: 2, sourceCol: 13, keyCol: 18, additionalSourcesCol: 20, lastCheckedCol: 17, maxCol: 28 },
 };
+
+/**
+ * Intelligence columns, appended AFTER the 31 columns the funding pipeline owns.
+ *
+ * Deliberately placed beyond maxCol (31) so the two writers never collide: the
+ * funding pipeline writes A:AE by position and is unaware of these, while the
+ * enrichment pass writes only this block. Reordering A:AE would break the
+ * pipeline, so nothing here touches it.
+ */
+const INTEL_START_COL = 32; // AF
+const INTEL_FIELDS = [
+  'Target Score',        // AF
+  'Tier',                // AG
+  'Signals',             // AH
+  'ATS Platform',        // AI
+  'ATS Board Slug',      // AJ
+  'Careers URL (verified)', // AK
+  'Open Roles',          // AL
+  'Growth/BD Roles Open',// AM
+  'Growth/BD Role Titles',  // AN
+  'Roles Last Checked',  // AO
+  'POC Name',            // AP
+  'POC Title',           // AQ
+  'POC Contact',         // AR
+  'Outreach Status',     // AS
+  'Outreach Date',       // AT
+  'Outreach Notes'       // AU
+];
+// Field name -> offset within the block. Keep in step with INTEL_FIELDS.
+const INTEL_OFFSET = {
+  targetScore: 0, tier: 1, signals: 2, atsPlatform: 3, atsSlug: 4,
+  careersUrl: 5, openRoles: 6, targetRoles: 7, targetTitles: 8, rolesChecked: 9,
+  pocName: 10, pocTitle: 11, pocContact: 12,
+  outreachStatus: 13, outreachDate: 14, outreachNotes: 15
+};
+// Columns a human edits. The enrichment pass must never overwrite these.
+const INTEL_HUMAN_FIELDS = ['pocName', 'pocTitle', 'pocContact', 'outreachStatus', 'outreachDate', 'outreachNotes'];
+
+function ensureIntelHeaders(sheet) {
+  const needed = INTEL_START_COL + INTEL_FIELDS.length - 1;
+  if (sheet.getMaxColumns() < needed) {
+    sheet.insertColumnsAfter(sheet.getMaxColumns(), needed - sheet.getMaxColumns());
+  }
+  sheet.getRange(1, INTEL_START_COL, 1, INTEL_FIELDS.length).setValues([INTEL_FIELDS]);
+}
+
+/**
+ * Rows that still need an ATS lookup: a website is known, and the board has
+ * either never been checked or was checked longer ago than maxAgeDays.
+ */
+function getEnrichmentQueue(sheet, limit, maxAgeDays) {
+  const config = STREAMS.funding;
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return [];
+  const count = lastRow - 1;
+
+  // One read of A:AE, then the intel block. The scoring inputs (stage, amount,
+  // date, customer type, hiring flag) travel with the queue so the runner can
+  // score without a second round trip per row.
+  const core = sheet.getRange(2, 1, count, config.maxCol).getValues();
+  const checked = sheet.getRange(2, INTEL_START_COL + INTEL_OFFSET.rolesChecked, count, 1).getValues();
+  const scores = sheet.getRange(2, INTEL_START_COL + INTEL_OFFSET.targetScore, count, 1).getValues();
+
+  const cutoff = Date.now() - (maxAgeDays * 86400000);
+  const queue = [];
+  for (let i = 0; i < count; i++) {
+    const row = core[i];
+    const company = String(row[config.companyCol - 1] || '').trim();
+    const website = String(row[11] || '').trim();   // L: Website
+    const key = String(row[config.keyCol - 1] || '').trim();
+    if (!company || !website || !key) continue;
+    const last = String(checked[i][0] || '').trim();
+    if (last) {
+      const when = Date.parse(last.replace(' UTC', 'Z').replace(' ', 'T'));
+      if (!isNaN(when) && when > cutoff) continue;
+    }
+    queue.push({
+      key: key, company: company, website: website,
+      stage: String(row[2] || ''),
+      amount: row[3] === '' || row[3] === null ? null : Number(row[3]) || null,
+      date: dateKey(row[0]),
+      customerType: String(row[7] || ''),
+      hiringFlag: String(row[10] || ''),
+      eventType: String(row[config.eventTypeCol - 1] || ''),
+      score: Number(scores[i][0]) || 0,
+      lastChecked: last
+    });
+  }
+  // Highest-scoring first, so a capped run spends its budget on the best targets.
+  queue.sort(function (a, b) { return b.score - a.score; });
+  return queue.slice(0, limit);
+}
+
+/**
+ * Applies enrichment + scoring results, matched by dedupe key.
+ *
+ * Two reads and ONE write regardless of how many rows are updated. Matching on
+ * the key rather than a row number matters because new rows are inserted at
+ * row 2, so any row number the caller saw earlier may already have shifted.
+ * Human-entered outreach columns are never touched.
+ */
+function applyIntelUpdates(sheet, updates) {
+  if (!Array.isArray(updates) || !updates.length) return 0;
+  const config = STREAMS.funding;
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+  const count = lastRow - 1;
+  const width = INTEL_FIELDS.length;
+
+  const keys = sheet.getRange(2, config.keyCol, count, 1).getValues();
+  const rowByKey = {};
+  for (let i = 0; i < count; i++) {
+    const key = String(keys[i][0] || '').trim();
+    if (key && rowByKey[key] === undefined) rowByKey[key] = i;
+  }
+
+  const block = sheet.getRange(2, INTEL_START_COL, count, width).getValues();
+  let applied = 0;
+  updates.forEach(function (update) {
+    const index = rowByKey[String(update.key || '').trim()];
+    if (index === undefined) return;
+    Object.keys(INTEL_OFFSET).forEach(function (field) {
+      if (INTEL_HUMAN_FIELDS.indexOf(field) >= 0) return; // never clobber human edits
+      const value = update[field];
+      if (value === undefined || value === null) return;
+      block[index][INTEL_OFFSET[field]] = value;
+    });
+    applied++;
+  });
+
+  if (applied) sheet.getRange(2, INTEL_START_COL, count, width).setValues(block);
+  return applied;
+}
 
 function normalizeCompany(name) {
   return String(name || '').toLowerCase()
@@ -369,28 +554,57 @@ function dateKey(value) {
   return String(value || '').trim().slice(0, 10);
 }
 
+// Month granularity, deliberately. One raise gets reported across several days by
+// several outlets; keying on the exact date, stage and amount made each of those a
+// separate "event", which is why one company could occupy six rows. Trade-off: a
+// company that genuinely raises twice inside one calendar month merges into one row.
+function monthKey(value) {
+  return dateKey(value).slice(0, 7);
+}
+
+function fundingNaturalKey(company, eventType, dateValue) {
+  const norm = normalizeCompany(company);
+  if (!norm) return '';
+  const type = String(eventType || 'Funding round').toLowerCase().trim();
+  return [norm, type, monthKey(dateValue)].join('|');
+}
+
 function naturalEventKey(stream, row) {
   const config = STREAMS[stream];
   const company = normalizeCompany(row[config.companyCol - 1]);
   if (!company) return '';
   if (stream === 'funding') {
-    const date = dateKey(row[0]);
-    const stage = String(row[2] || '').toLowerCase().trim();
-    const amount = String(row[3] || '').replace(/[,$\s]/g, '').toLowerCase();
-    return [company, date, stage, amount].join('|');
+    return fundingNaturalKey(row[config.companyCol - 1], row[config.eventTypeCol - 1], row[0]);
   }
   const date = dateKey(row[3] || row[0]);
   const signal = String(row[2] || '').toLowerCase().trim();
   return [company, date, signal].join('|');
 }
 
+// Reads ONLY the columns the key needs. The previous version read the whole sheet at
+// full width on every POST -- at ~1000 rows x 31 columns that is ~31,000 cells per
+// request, which is what exhausted the Apps Script execution budget and left the
+// half-written rows behind. Three single-column reads are roughly a tenth of the data.
 function getNaturalEventRowMap(stream, sheet) {
   const config = STREAMS[stream];
   const lastRow = sheet.getLastRow();
   const map = {};
   if (lastRow < 2) return map;
+  const count = lastRow - 1;
+
+  if (stream === 'funding') {
+    const dates = sheet.getRange(2, 1, count, 1).getValues();
+    const companies = sheet.getRange(2, config.companyCol, count, 1).getValues();
+    const types = sheet.getRange(2, config.eventTypeCol, count, 1).getValues();
+    for (let i = 0; i < count; i++) {
+      const key = fundingNaturalKey(companies[i][0], types[i][0], dates[i][0]);
+      if (key && !map[key]) map[key] = i + 2;
+    }
+    return map;
+  }
+
   const width = config.maxCol || Math.max(config.keyCol, config.sourceCol, config.additionalSourcesCol);
-  sheet.getRange(2, 1, lastRow - 1, width).getValues().forEach(function (row, offset) {
+  sheet.getRange(2, 1, count, width).getValues().forEach(function (row, offset) {
     const natural = naturalEventKey(stream, row);
     if (natural && !map[natural]) map[natural] = offset + 2;
   });
@@ -439,6 +653,8 @@ function doPost(e) {
     const naturalRows = getNaturalEventRowMap(stream, sheet);
     const rows = Array.isArray(body.rows) ? body.rows : [];
     const reviewRows = Array.isArray(body.reviewRows) ? body.reviewRows : [];
+    const intelUpdates = Array.isArray(body.intelUpdates) ? body.intelUpdates : [];
+    if (intelUpdates.length && stream !== 'funding') throw new Error('intelUpdates are only valid for stream=funding');
     if (reviewRows.length && stream !== 'crypto') throw new Error('reviewRows are only valid for stream=crypto');
     const batchSources = {};
     const batchKeys = {};
@@ -473,18 +689,49 @@ function doPost(e) {
 
     if (toAdd.length) {
       const width = config.maxCol || toAdd[0].length;
+      // Normalise BEFORE touching the sheet. A row that fails validation must not be
+      // able to abort the job after blank rows have already been inserted.
       const normalized = toAdd.map(function (row) {
         if (row.length > width) throw new Error('A row exceeds the configured column count.');
         while (row.length < width) row.push('');
         return row;
       });
+
+      // insertRowsBefore + setValues is two operations. If the script dies between
+      // them -- the execution-time limit being the usual cause -- the blank rows are
+      // already committed and stay in the sheet forever. 187 such rows had
+      // accumulated, and because each one inflates lastRow, every later run read more
+      // data and was more likely to time out: the failure fed itself.
+      // Roll the insert back on any failure so a bad run leaves the sheet unchanged.
       sheet.insertRowsBefore(2, normalized.length);
-      sheet.getRange(2, 1, normalized.length, width).setValues(normalized);
+      try {
+        sheet.getRange(2, 1, normalized.length, width).setValues(normalized);
+        SpreadsheetApp.flush();
+      } catch (writeErr) {
+        try {
+          sheet.deleteRows(2, normalized.length);
+          SpreadsheetApp.flush();
+        } catch (rollbackErr) {
+          // Rollback itself failed; say so explicitly rather than reporting a plain
+          // write error, because the sheet now needs cleanupBlankRows().
+          throw new Error('write failed AND rollback failed (' + rollbackErr +
+            '); run Tracker Tools > Remove Blank Rows. Original error: ' + writeErr);
+        }
+        throw writeErr;
+      }
     }
 
     // Write the review queue before marking sources processed. If the queue write fails,
     // the request returns ok:false and the Python backfill keeps the entire batch retryable.
     const reviewResult = reviewRows.length ? upsertCryptoReviewRows(reviewRows) : { appended: 0, updated: 0 };
+
+    // Enrichment/scoring block. Applied after the row inserts above so a brand-new
+    // row can be scored in the same request that created it.
+    let intelApplied = 0;
+    if (intelUpdates.length) {
+      ensureIntelHeaders(sheet);
+      intelApplied = applyIntelUpdates(sheet, intelUpdates);
+    }
 
     // Apply the crypto presentation after inserts/updates so newly added rows match the table style.
     formatTrackerSheet(sheet, stream, toAdd.length);
@@ -497,6 +744,7 @@ function doPost(e) {
     recordProcessedSources(stream, processed);
     return jsonOut({ ok: true, stream: stream, appended: toAdd.length, updated: toUpdate.length,
       reviewAppended: reviewResult.appended, reviewUpdated: reviewResult.updated,
+      intelApplied: intelApplied,
       skipped: skipped, processed: processed.length });
   } catch (err) {
     return jsonOut({ ok: false, error: String(err) });
@@ -514,6 +762,14 @@ function doGet(e) {
     const action = params.action || 'health';
     const sheet = getSheetForStream(stream);
     if (action === 'health' || action === 'format') formatTrackerSheet(sheet, stream);
+    if (action === 'enrichment_queue') {
+      if (stream !== 'funding') return jsonOut({ ok: false, error: 'enrichment_queue requires stream=funding' });
+      ensureIntelHeaders(sheet);
+      const limit = Math.min(Math.max(parseInt(params.limit, 10) || 60, 1), 400);
+      const maxAgeDays = Math.max(parseInt(params.maxAgeDays, 10) || 14, 0);
+      const queue = getEnrichmentQueue(sheet, limit, maxAgeDays);
+      return jsonOut({ ok: true, stream: stream, rows: queue, count: queue.length });
+    }
     if (action === 'existing_sources') return jsonOut({ ok: true, stream: stream, sources: getExistingSources(stream, sheet) });
     if (action === 'existing_keys') return jsonOut({ ok: true, stream: stream, keys: getExistingKeys(stream, sheet) });
     if (action === 'existing_companies') {
