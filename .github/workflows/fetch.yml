@@ -21,6 +21,12 @@ jobs:
           cache: "pip"
       - name: Install dependencies
         run: pip install -r requirements.txt
+      # Fail before writing rather than after. Every case in these tests is a
+      # value that actually reached the sheet and corrupted a column.
+      - name: Verify validators
+        run: |
+          python tests/test_validate.py
+          python tests/test_scoring.py
       - name: Run funding intelligence
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}

@@ -1,0 +1,57 @@
+name: enrich-outreach-targets
+
+# Qualification pass, deliberately separate from discovery (fetch.yml).
+#
+# fetch.yml answers "who raised?" from news, hourly.
+# This answers "who is actually hiring a growth person?" from each company's own
+# public job board. That data changes on the order of days, not minutes, so this
+# runs a few times a day instead of hourly and keeps third-party request volume
+# low. Only the appended intelligence columns (AF onward) are written.
+
+on:
+  schedule:
+    # 03:40 and 15:40 UTC. Off the hour on purpose: scheduled jobs queued at :00
+    # get delayed, and these two slots avoid the busiest window.
+    - cron: "40 3,15 * * *"
+  workflow_dispatch:
+    inputs:
+      max_companies:
+        description: "How many companies to check in this run"
+        required: false
+        default: "60"
+      recheck_days:
+        description: "Re-check a board if last checked more than this many days ago"
+        required: false
+        default: "14"
+
+concurrency:
+  # Shares the funding group so this can never run while fetch.yml is writing.
+  # Two writers racing on the same sheet is how partial writes happen.
+  group: startup-intelligence-funding
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Verify validators before touching the sheet
+        run: python tests/test_validate.py
+      - name: Enrich and score outreach targets
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_TOKEN: ${{ secrets.WEBHOOK_TOKEN }}
+          # tracker_common imports at module load and requires this to be present,
+          # even though this job never calls a model.
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          ENRICH_MAX_COMPANIES: ${{ github.event.inputs.max_companies || '60' }}
+          ENRICH_RECHECK_DAYS: ${{ github.event.inputs.recheck_days || '14' }}
+          ATS_REQUEST_DELAY: "0.6"
+        run: python enrich_targets.py
