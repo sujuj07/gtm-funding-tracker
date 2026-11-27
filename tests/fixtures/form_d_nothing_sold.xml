@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<edgarSubmission xmlns="http://www.sec.gov/edgar/common">
+  <primaryIssuer>
+    <entityName>EARLYBIRD AI LABS INC</entityName>
+    <issuerAddress><city>AUSTIN</city><stateOrCountry>TX</stateOrCountry></issuerAddress>
+    <yearOfInc><withinFiveYears>true</withinFiveYears><value>2026</value></yearOfInc>
+  </primaryIssuer>
+  <offeringData>
+    <industryGroup><industryGroupType>Computers</industryGroupType></industryGroup>
+    <offeringSalesAmounts>
+      <totalOfferingAmount>3000000</totalOfferingAmount>
+      <totalAmountSold>0</totalAmountSold>
+    </offeringSalesAmounts>
+  </offeringData>
+</edgarSubmission>

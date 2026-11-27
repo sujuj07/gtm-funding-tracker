@@ -10,11 +10,14 @@ from tracker_common import (
     published_timestamp, webhook_get, excluded_nft_or_meme,
 )
 from scoring import score_clean_row
+from sec_form_d import fetch_form_d_rows
 from validate import is_usable, validate_extraction
 
 STREAM = "funding"
 MIN_DELAY = float(os.getenv("MODEL_DELAY_SECONDS", "2.5"))
 MAX_ITEMS_PER_RUN = int(os.getenv("MAX_ITEMS_PER_RUN", "4"))
+# SEC Form D: US-only, structured, keyless. Set SEC_FORM_D=0 to turn it off.
+SEC_FORM_D_ENABLED = os.getenv("SEC_FORM_D", "1") not in ("0", "false", "False", "")
 SAVE_BATCH_SIZE = int(os.getenv("SAVE_BATCH_SIZE", "12"))
 
 RSS_SOURCES = [
@@ -86,6 +89,109 @@ SOURCE BODY: {body}
 """
 
 
+def build_row(clean: dict, *, key: str, date: str, source_url: str,
+              publisher: str, published: str, notes: str) -> list:
+    """Assemble one sheet row (columns A..AE) from a validated `clean` dict.
+
+    Shared by the news path and the SEC Form D path so the two writers cannot
+    drift apart in column order or content. Columns I and J are scored here.
+    """
+    gtm_score, gtm_why = score_clean_row(clean, fallback_date=date)
+    hq = ", ".join(filter(None, [clean.get("hq_city", ""), clean.get("hq_country", "")]))
+    return [
+        date, clean["company"], clean["stage"], clean.get("amount_usd") or "",
+        clean.get("sector", ""), hq, clean.get("one_liner", ""),
+        "B2B" if clean.get("is_b2b") else "B2C/Consumer/Unknown",
+        gtm_score, gtm_why, clean.get("hiring_flag", "Unknown"),
+        clean.get("website", ""),
+        # Careers URL is intentionally blank: it used to hold website + "/careers",
+        # a value built by concatenation and never fetched.
+        "",
+        ", ".join(clean.get("founders") or []),
+        clean.get("lead_investor", ""), source_url,
+        "New", notes, key,
+        clean.get("broad_offerings", ""), clean.get("niche_presence", ""),
+        clean.get("product_type", ""), clean.get("target_customers", ""),
+        ", ".join(clean.get("other_investors") or []),
+        clean.get("valuation_usd") or "", clean["event_type"], publisher,
+        clean.get("confidence", "Low"),
+        datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"), published,
+    ]
+
+
+def collect_form_d_rows(existing_keys: set, seen_keys: set) -> list[list]:
+    """Rows from SEC Form D filings, built without a model call.
+
+    Form D is a filing rather than a news story, so the fields arrive already
+    structured and attested: no extraction, no tokens, and no validation
+    rejections. It is the only source here whose amounts and founder names are
+    first-party rather than inferred from prose.
+    """
+    if not SEC_FORM_D_ENABLED:
+        return []
+    print("Fetching SEC Form D filings (structured, no model call)")
+    try:
+        filings = fetch_form_d_rows()
+    except Exception as exc:
+        # Never let an optional source break the run.
+        print(f"  [warn] SEC Form D fetch failed: {exc}")
+        return []
+
+    rows = []
+    for clean in filings:
+        key = funding_event_key(clean["company"], clean["event_date"], clean["event_type"])
+        if key in existing_keys or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        notes = "Source: SEC Form D filing (Regulation D exempt offering)."
+        if clean.get("_total_offering") and clean.get("amount_usd"):
+            notes += (f" Total offering ${clean['_total_offering']:,.0f};"
+                      f" sold to date ${clean['amount_usd']:,.0f}.")
+        elif clean.get("_total_offering"):
+            notes += (f" Total offering ${clean['_total_offering']:,.0f};"
+                      " nothing recorded as sold at filing time.")
+        rows.append(build_row(
+            clean, key=key, date=clean["event_date"],
+            source_url=clean["_source_url"], publisher=clean["_publisher"],
+            published=clean["_published"], notes=notes,
+        ))
+        print(f"  + {clean['company'][:40]:40s} | Form D | "
+              f"{('$' + format(int(clean['amount_usd']), ',')) if clean.get('amount_usd') else 'amount not yet sold'}")
+    print(f"SEC Form D contributed {len(rows)} new row(s)")
+    return rows
+
+
+def select_for_processing(fresh: list[dict], limit: int) -> list[dict]:
+    """Choose which candidates to process, reserving a quarter of the slots for the
+    oldest unprocessed items.
+
+    Processing strictly newest-first starved the backlog. Roughly 244 candidates
+    are gathered per run against a cap of a few dozen, so an item that missed the
+    cut was not merely delayed -- it was permanently outranked by newer arrivals
+    and would never be processed at all. Reserving a share of each run for the
+    oldest unprocessed items means the tail actually drains.
+    """
+    if len(fresh) <= limit:
+        return fresh
+    newest_first = sorted(fresh, key=published_timestamp, reverse=True)
+    backlog_slots = max(1, limit // 4)
+    chosen: list[dict] = []
+    seen: set[str] = set()
+    for item in newest_first[: limit - backlog_slots]:
+        chosen.append(item)
+        seen.add(item.get("link", ""))
+    # Oldest first, to pull the stalled tail forward.
+    for item in reversed(newest_first):
+        if len(chosen) >= limit:
+            break
+        link = item.get("link", "")
+        if link in seen:
+            continue
+        chosen.append(item)
+        seen.add(link)
+    return chosen
+
+
 def make_items():
     items = []
     for url, label in RSS_SOURCES:
@@ -112,13 +218,21 @@ def main():
     existing_keys = webhook_get(STREAM, "existing_keys")
     items = make_items()
     fresh = [x for x in items if x.get("link") and x["link"] not in existing_sources]
-    fresh.sort(key=published_timestamp, reverse=True)
-    fresh = fresh[:MAX_ITEMS_PER_RUN]
-    print(f"Fetched {len(items)} unique feed results; {len(fresh)} new sources to classify")
+    backlog = len(fresh)
+    fresh = select_for_processing(fresh, MAX_ITEMS_PER_RUN)
+    print(f"Fetched {len(items)} unique feed results; {backlog} unprocessed; "
+          f"classifying {len(fresh)} this run "
+          f"({max(1, MAX_ITEMS_PER_RUN // 4)} slot(s) reserved for the oldest backlog)")
 
     client = groq_client()
     pending, processed = [], []
+    # Seeded from what the sheet already has, then shared by BOTH source paths so a
+    # news article and a Form D filing for the same company+month cannot both land
+    # as separate rows within one run.
     seen_keys = set(existing_keys)
+    # Structured sources first: they cost no tokens and cannot fail extraction, so a
+    # model rate-limit later in the run cannot cost us these rows.
+    pending.extend(collect_form_d_rows(existing_keys, seen_keys))
     total_saved = 0
     total_updated = 0
 
@@ -172,7 +286,6 @@ def main():
             date = clean["event_date"] or event_date
             key = funding_event_key(clean["company"], date, ev_type)
             seen_keys.add(key)
-            hq = ", ".join(filter(None, [clean["hq_city"], clean["hq_country"]]))
 
             # Notes carries the evidence note, any hiring prose that was moved out of
             # the enum column, and the validation problems -- so a bad extraction is
@@ -184,34 +297,15 @@ def main():
                 f"data quality: {'; '.join(problems)}" if problems else "",
             ]))
 
-            # Scored here rather than in a separate pass: every input is already in
-            # `clean`, so each row is scored as it is written and columns I/J (which
-            # had been empty on 536 rows) are populated from the start.
-            gtm_score, gtm_why = score_clean_row(clean, fallback_date=event_date)
-
-            row = [
-                    date, clean["company"], clean["stage"], clean["amount_usd"] or "",
-                    clean["sector"], hq, clean["one_liner"],
-                    "B2B" if clean["is_b2b"] else "B2C/Consumer/Unknown",
-                    gtm_score, gtm_why,
-                    clean["hiring_flag"], clean["website"],
-                    # Careers URL is left for the ATS enrichment pass to fill with a
-                    # board URL that has actually been fetched. It used to be
-                    # f"{website}/careers" -- a string built by concatenation and never
-                    # verified, which is why this column was 100% populated and 0% real.
-                    "",
-                    ", ".join(clean["founders"]), clean["lead_investor"], item.get("link", ""),
-                    "New", notes, key,
-                    clean["broad_offerings"], clean["niche_presence"], clean["product_type"],
-                    clean["target_customers"], ", ".join(clean["other_investors"]),
-                    clean["valuation_usd"] or "", ev_type, item.get("publisher", ""),
-                    clean["confidence"], datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-                    item.get("published", ""),
-            ]
+            row = build_row(
+                clean, key=key, date=date, source_url=item.get("link", ""),
+                publisher=item.get("publisher", ""), published=item.get("published", ""),
+                notes=notes,
+            )
             pending.append(row)
             flag = f" [{len(problems)} data issue(s)]" if problems else ""
             print(f"  + {clean['company']} | {ev_type} | {clean['stage']} | "
-                  f"score={gtm_score} {gtm_why[:60]} [{clean['confidence']}]{flag}")
+                  f"score={row[8]} {str(row[9])[:60]} [{clean['confidence']}]{flag}")
         if len(pending) >= SAVE_BATCH_SIZE or len(processed) >= SAVE_BATCH_SIZE:
             flush()
         time.sleep(MIN_DELAY)

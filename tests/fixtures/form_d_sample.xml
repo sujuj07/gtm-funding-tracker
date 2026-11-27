@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<edgarSubmission xmlns="http://www.sec.gov/edgar/common">
+  <schemaVersion>X0708</schemaVersion>
+  <submissionType>D</submissionType>
+  <primaryIssuer>
+    <cik>0001234567</cik>
+    <entityName>ACME ROBOTICS INC.</entityName>
+    <issuerAddress>
+      <street1>123 Main Street</street1>
+      <city>SAN FRANCISCO</city>
+      <stateOrCountry>CA</stateOrCountry>
+      <zipCode>94105</zipCode>
+    </issuerAddress>
+    <jurisdictionOfInc>DELAWARE</jurisdictionOfInc>
+    <entityType>Corporation</entityType>
+    <yearOfInc>
+      <withinFiveYears>true</withinFiveYears>
+      <value>2025</value>
+    </yearOfInc>
+  </primaryIssuer>
+  <relatedPersonsList>
+    <relatedPersonInfo>
+      <relatedPersonName><firstName>Jane</firstName><lastName>Doe</lastName></relatedPersonName>
+      <relatedPersonRelationshipList>
+        <relationship>Executive Officer</relationship>
+        <relationship>Director</relationship>
+      </relatedPersonRelationshipList>
+    </relatedPersonInfo>
+    <relatedPersonInfo>
+      <relatedPersonName><firstName>Raj</firstName><lastName>Patel</lastName></relatedPersonName>
+      <relatedPersonRelationshipList><relationship>Director</relationship></relatedPersonRelationshipList>
+    </relatedPersonInfo>
+  </relatedPersonsList>
+  <offeringData>
+    <industryGroup><industryGroupType>Other Technology</industryGroupType></industryGroup>
+    <issuerSize><revenueRange>No Revenues</revenueRange></issuerSize>
+    <offeringSalesAmounts>
+      <totalOfferingAmount>5000000</totalOfferingAmount>
+      <totalAmountSold>4200000</totalAmountSold>
+      <totalRemaining>800000</totalRemaining>
+    </offeringSalesAmounts>
+  </offeringData>
+</edgarSubmission>

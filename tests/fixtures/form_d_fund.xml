@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<edgarSubmission xmlns="http://www.sec.gov/edgar/common">
+  <primaryIssuer>
+    <entityName>HORIZON CAPITAL PARTNERS FUND III LP</entityName>
+    <issuerAddress><city>NEW YORK</city><stateOrCountry>NY</stateOrCountry></issuerAddress>
+    <yearOfInc><overFiveYears>true</overFiveYears></yearOfInc>
+  </primaryIssuer>
+  <offeringData>
+    <industryGroup><industryGroupType>Pooled Investment Fund</industryGroupType></industryGroup>
+    <offeringSalesAmounts>
+      <totalOfferingAmount>250000000</totalOfferingAmount>
+      <totalAmountSold>180000000</totalAmountSold>
+    </offeringSalesAmounts>
+  </offeringData>
+</edgarSubmission>

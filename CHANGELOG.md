@@ -180,3 +180,73 @@ column, the fabricated `website + "/careers"` value, and empty score columns. It
 runs the same `validate_extraction` + `score_clean_row` path as `main.py`, and its
 dedupe key matches too (it was still using `event_key` with stage and amount, so
 backfill rows carried a different key format than live rows).
+
+## v17 — Throughput, backlog fairness, and SEC Form D
+
+### The real constraint was never the number of sources
+Per run the pipeline gathered ~244 candidates (13 RSS feeds x 8, 10 Google News
+queries x 10, up to 40 from DeFiLlama) and processed **4**. The cron asks for hourly
+but GitHub skips scheduled runs under load, so the real cadence was 3-4 runs a day:
+roughly 12-16 items processed daily against a pool that refreshes to 244 every run.
+
+Adding sources would have made that worse, not better. `MAX_ITEMS_PER_RUN` is now 25,
+which is safe in a way it was not before: validation stops malformed values at the
+source, which is part of what that cap was implicitly protecting against.
+
+### Backlog starvation
+`fresh` was sorted newest-first and truncated. An item that missed the cut was not
+delayed — it was permanently outranked by every newer arrival and would never be
+processed. `select_for_processing()` now reserves a quarter of each run's slots for
+the oldest unprocessed candidates, so the tail drains.
+
+### SEC Form D (`sec_form_d.py`)
+The first source here that needs no model call. Form D is a filing, not a news story:
+companies raising under Regulation D (most US seed and Series A rounds) must file one,
+under penalty of perjury, and the SEC publishes it as structured XML.
+
+    company name   <- entityName          raise amount  <- totalAmountSold
+    HQ             <- issuerAddress       founding year <- yearOfInc
+    officer names  <- relatedPersonsList  industry      <- industryGroup
+
+No tokens, no extraction failures, no validation rejections. It also fills the two
+fields news sources almost never carry: founding year (previously empty on nearly
+every row) and founder names (previously empty on ~88%).
+
+Deliberate limits, all visible in the output rather than papered over:
+
+- **US only.** Form D adds nothing for India or Europe.
+- **Stage stays `Unknown`.** A filing does not name a round stage, and inferring
+  "Seed" from the amount would be a guess written into a validated column.
+- **Amount is what has been *sold* at filing time**, so it can be blank on a real
+  round. Zero is reported as unknown, never as $0.
+- **Pooled investment funds are filtered out.** A VC raising its own vehicle files a
+  Form D too.
+
+Because Form D rows lack stage (+5) and B2B (+2), they score lower than news rows
+despite being more reliable. Rather than fake those fields, scoring now credits what
+Form D uniquely provides:
+
+### New signal: `NAMED-CONTACTS(n)`
++2 when the row carries named people. A row with no contact needs a separate lookup
+before it can be used for outreach at all, so this is a real difference in
+usefulness, not a proxy for one.
+
+### Shared row builder
+`build_row()` is now used by both the news path and the Form D path, so the two
+writers cannot drift apart in column order or content. A bug found during this
+change: `seen_keys` was being re-initialised after the Form D pass, which would have
+let a news article and a filing for the same company+month both land as separate rows
+within one run.
+
+### Sheet documentation
+New **README & Glossary** tab: what the sheet is, how a row arrives, every column
+A-AE explained, score and tier bands, all 19 signal tags, source inventory with
+trust notes, throughput facts, and a "what to trust / what is usually empty / what to
+distrust" section.
+
+### Tests
+41 cases across three files (`test_validate.py` 14, `test_scoring.py` 14,
+`test_sec_form_d.py` 13), all running in CI before any write. Form D parsing is
+tested against fixtures mirroring real EDGAR shapes — an operating company, a VC fund
+that must be filtered out, and a filing with nothing sold yet — but **not against
+live EDGAR**, since this environment has no outbound network.

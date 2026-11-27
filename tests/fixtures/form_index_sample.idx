@@ -1,0 +1,6 @@
+Form Type   Company Name                                      CIK        Date Filed  File Name
+---------------------------------------------------------------------------------------------
+D           ACME ROBOTICS INC.                                1234567    20261127    edgar/data/1234567/000123456726000123.txt
+D/A         AMENDED HOLDINGS LLC                              7654321    20261127    edgar/data/7654321/000765432126000044.txt
+DEF 14A     SOME BIG CORP                                     1111111    20261127    edgar/data/1111111/000111111126000099.txt
+D           EARLYBIRD AI LABS INC                             2222222    20261127    edgar/data/2222222/000222222226000007.txt

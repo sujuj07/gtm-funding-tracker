@@ -82,6 +82,7 @@ def score_row(
     event_type: str = "",
     team_size: int | None = None,
     founded_year: int | None = None,
+    named_contacts: int = 0,
 ) -> tuple[int, str, str]:
     """Score one row.
 
@@ -161,6 +162,15 @@ def score_row(
         score -= 3
         tags.append("LAYOFF-REPORTED")
 
+    # --- a named person to actually email ---
+    # Worth real weight because it is the difference between a lead and a company
+    # name. News sources carry founder names on roughly 1 row in 8; SEC Form D
+    # lists officers and directors on every filing. A row with no contact needs a
+    # separate lookup before it can be used at all.
+    if named_contacts:
+        score += 2
+        tags.append(f"NAMED-CONTACTS({named_contacts})")
+
     # --- fit and freshness ---
     if is_b2b:
         score += 2
@@ -196,5 +206,6 @@ def score_clean_row(clean: dict, fallback_date: str = "") -> tuple[int, str]:
         event_type=clean.get("event_type") or "",
         team_size=clean.get("team_size"),
         founded_year=clean.get("founded_year"),
+        named_contacts=len(clean.get("founders") or []),
     )
     return score, f"[{tier}] {why}" if why else f"[{tier}]"
