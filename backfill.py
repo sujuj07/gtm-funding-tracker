@@ -10,6 +10,7 @@ import math
 from datetime import datetime, timedelta, timezone
 
 from tracker_common import (
+    check_deployed_script_version,
     MODEL_CHAIN_LABEL, defillama_raises, extract_json, fetch_google_news, funding_event_key,
     groq_client, post_rows, webhook_get, norm_company, parse_event_date, published_timestamp,
     excluded_nft_or_meme,
@@ -140,6 +141,7 @@ def main():
         return
     window_start, window_end = window
     print(f"Historical funding backfill | {window_start} <= dates < {window_end} | current target end={DATE_TO} | model-route={MODEL_CHAIN_LABEL}")
+    check_deployed_script_version()
     items, search_incomplete = collect_items(window_start, window_end)
     existing_sources = webhook_get(STREAM, "existing_sources")
     existing_keys = webhook_get(STREAM, "existing_keys")

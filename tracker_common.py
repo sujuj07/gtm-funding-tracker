@@ -1481,6 +1481,56 @@ def webhook_get(stream: str, action: str) -> set[str]:
     return set(str(x) for x in values if x)
 
 
+# Bump alongside SCRIPT_VERSION in apps_script/Code.gs.
+EXPECTED_SCRIPT_VERSION = "v16"
+
+
+def check_deployed_script_version(expected: str = EXPECTED_SCRIPT_VERSION) -> str | None:
+    """Warn loudly if the deployed Apps Script is older than this code.
+
+    Saving the Apps Script editor does not change what the web app serves: a
+    deployment is pinned to a numbered version, and "Deploy > New deployment"
+    mints a different URL rather than updating the existing one. Both mistakes
+    leave an old doPost running -- which still accepts rows, so nothing looks
+    wrong while the blank-row bug remains live.
+
+    Deliberately a warning, not a fatal error: a stale receiver still records
+    data, and stopping collection outright would be the worse failure. Returns
+    the reported version, or None if it could not be determined.
+    """
+    try:
+        response = requests.get(
+            WEBHOOK_URL,
+            params={"token": WEBHOOK_TOKEN, "stream": "funding", "action": "health"},
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+        version = str(data.get("scriptVersion") or "")
+    except Exception as exc:
+        print(f"[warn] could not check the deployed Apps Script version: {exc}")
+        return None
+
+    if version == expected:
+        print(f"[ok] deployed Apps Script is {version}")
+        return version
+
+    reported = version or "none (pre-v15)"
+    print("=" * 72)
+    print(f"[WARNING] DEPLOYED APPS SCRIPT IS STALE: reports {reported}, expected {expected}")
+    print("  The blank-row rollback and the narrowed sheet read are NOT active, so")
+    print("  this run can still leave permanently empty rows in the sheet.")
+    print("  Fix: paste the current apps_script/Code.gs, save, then")
+    print("    Deploy > Manage deployments > pencil icon on the EXISTING Web app")
+    print("    > Version: 'New version' > Deploy        (this keeps the same URL)")
+    print("  Do NOT use 'Deploy > New deployment': it creates a DIFFERENT URL and")
+    print("  leaves the WEBHOOK_URL secret pointing at the old code. If you already")
+    print("  did, either update the WEBHOOK_URL secret to the new /exec URL, or")
+    print("  update the original deployment to a new version as above.")
+    print("=" * 72)
+    return version or None
+
+
 def webhook_get_review_queue() -> list[list[Any]]:
     """Read the visible Crypto Review Queue; errors must not look like an empty queue."""
     response = requests.get(

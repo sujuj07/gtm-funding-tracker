@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timezone
 
 from tracker_common import (
+    check_deployed_script_version,
     MODEL_CHAIN_LABEL, defillama_raises, extract_json, fetch_google_news,
     fetch_rss_feed, funding_event_key, groq_client, norm_company, parse_event_date, post_rows,
     published_timestamp, webhook_get, excluded_nft_or_meme,
@@ -104,6 +105,9 @@ def make_items():
 
 def main():
     print(f"Funding intelligence run | model-route={MODEL_CHAIN_LABEL} | UTC={datetime.now(timezone.utc).isoformat()}")
+    # Checked up front so a stale receiver is visible at the top of the log,
+    # before any rows are written, rather than inferred later from damage.
+    check_deployed_script_version()
     existing_sources = webhook_get(STREAM, "existing_sources")
     existing_keys = webhook_get(STREAM, "existing_keys")
     items = make_items()
